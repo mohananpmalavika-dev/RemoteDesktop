@@ -30,6 +30,7 @@ pub enum EngineState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeviceEnrollmentRequest {
     pub enrollment_token: String,
     pub public_key_base64: String,
@@ -77,11 +78,31 @@ impl RemoteEngine {
     }
 
     pub fn initialize_identity(&mut self) -> Result<String, String> {
+        if let Some(manager) = &self.identity_manager {
+            return Ok(manager.public_key_base64());
+        }
         let mgr = KeyPairManager::generate();
         let pub_key = mgr.public_key_base64();
         self.identity_manager = Some(mgr);
         self.state = EngineState::Enrolled;
         Ok(pub_key)
+    }
+
+    #[cfg(windows)]
+    pub fn initialize_persisted_identity(&mut self, path: &std::path::Path) -> Result<String, String> {
+        if let Some(manager) = &self.identity_manager {
+            return Ok(manager.public_key_base64());
+        }
+        let manager = KeyPairManager::load_or_generate(path).map_err(|e| e.to_string())?;
+        let public_key = manager.public_key_base64();
+        self.identity_manager = Some(manager);
+        self.state = EngineState::Enrolled;
+        Ok(public_key)
+    }
+
+    /// Only a server-assigned Remote ID can be shared; a public key is not an ID.
+    pub fn shareable_remote_id(&self) -> Result<Option<String>, String> {
+        self.remote_id.as_ref().map(|id| format_remote_id(id)).transpose()
     }
 
     pub fn create_enrollment_request(
@@ -156,6 +177,14 @@ impl RemoteEngine {
             self.state = EngineState::Ready;
         }
     }
+}
+
+pub fn format_remote_id(value: &str) -> Result<String, String> {
+    let clean: String = value.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    if clean.len() != 9 || !clean.bytes().all(|c| c.is_ascii_digit()) {
+        return Err("The server did not return a valid 9-digit Remote ID.".into());
+    }
+    Ok(format!("{} {} {}", &clean[..3], &clean[3..6], &clean[6..]))
 }
 
 /// Dispatches an incoming remote control network payload with strict security validation
@@ -779,6 +808,31 @@ impl FileTransferManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shareable_identity_requires_server_enrollment() {
+        let mut engine = RemoteEngine::new();
+        let public_key = engine.initialize_identity().unwrap();
+        assert_eq!(engine.shareable_remote_id().unwrap(), None);
+        assert_eq!(engine.initialize_identity().unwrap(), public_key);
+        let request = engine.create_enrollment_request("ket_test", "Host").unwrap();
+        assert_eq!(request.public_key_base64, public_key);
+        assert_eq!(serde_json::to_value(request).unwrap()["publicKeyBase64"], public_key);
+        engine.set_enrolled_identity("device".into(), "123456789".into());
+        assert_eq!(engine.shareable_remote_id().unwrap(), Some("123 456 789".into()));
+        engine.initialize_identity().unwrap();
+        assert_eq!(engine.state(), EngineState::Ready);
+        engine.set_enrolled_identity("device".into(), public_key);
+        assert!(engine.shareable_remote_id().is_err());
+    }
+
+    #[test]
+    fn remote_id_must_be_exactly_nine_digits() {
+        assert_eq!(format_remote_id("001 002 003").unwrap(), "001 002 003");
+        for invalid in ["abcdefghi", "12345678", "1234567890", "123-456-789", "１２３４５６７８９"] {
+            assert!(format_remote_id(invalid).is_err());
+        }
+    }
 
     #[test]
     fn test_engine_initialization_and_enrollment_request() {

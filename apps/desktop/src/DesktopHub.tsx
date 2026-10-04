@@ -1,4 +1,5 @@
 import { useRef, useState, type FormEvent } from "react";
+import { formatRemoteId } from "./remoteIdentity";
 import {
   Monitor,
   HardDrive,
@@ -39,6 +40,9 @@ interface Props {
   activeTab: Tab;
   onTabChange: (tab: Tab) => void;
   remoteId: string;
+  identityError: string;
+  enrolling: boolean;
+  onEnroll: (apiUrl: string, enrollmentToken: string) => Promise<void>;
   deviceName: string;
   isElevated: boolean;
   monitorCount: number;
@@ -65,8 +69,11 @@ const tabs = [
 export function DesktopHub(p: Props) {
   const [query, setQuery] = useState("");
   const [showHelp, setShowHelp] = useState(false);
+  const [apiUrl, setApiUrl] = useState("");
+  const [enrollmentToken, setEnrollmentToken] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
-  const validIdentity = /^\d{9}$/.test(p.remoteId.replace(/\s/g, ""));
+  const formattedIdentity = formatRemoteId(p.remoteId);
+  const validIdentity = formattedIdentity !== null;
   const goConnect = (id = "") => {
     if (id) p.onRemoteIdChange(id);
     p.onTabChange("home");
@@ -410,7 +417,7 @@ export function DesktopHub(p: Props) {
                   <div
                     className={`remote-id-display ${!validIdentity ? "identity-unavailable" : ""}`}
                   >
-                    {p.remoteId}
+                    {formattedIdentity ?? (p.remoteId === "Loading..." ? "Loading..." : p.isNative ? "Registration required" : "Desktop app only")}
                   </div>
                   <button
                     className="copy-id-button"
@@ -426,6 +433,29 @@ export function DesktopHub(p: Props) {
                     <p className="inline-error" role="alert">
                       {p.copyError}
                     </p>
+                  )}
+                  {p.identityError && (
+                    <p className="inline-error" role="alert">{p.identityError}</p>
+                  )}
+                  {p.isNative && !validIdentity && p.remoteId !== "Loading..." && (
+                    <form className="enrollment-form" onSubmit={async (event) => {
+                      event.preventDefault();
+                      await p.onEnroll(apiUrl, enrollmentToken);
+                      setEnrollmentToken("");
+                    }}>
+                      <p>Register with your administrator's server to get your 9-digit Remote ID.</p>
+                      <label htmlFor="api-url">API server URL</label>
+                      <input id="api-url" type="url" value={apiUrl} required
+                        placeholder="https://your-server/api/v1" disabled={p.enrolling}
+                        onChange={(event) => setApiUrl(event.target.value)} />
+                      <label htmlFor="enrollment-token">Device enrollment token</label>
+                      <input id="enrollment-token" type="password" value={enrollmentToken} required
+                        autoComplete="off" disabled={p.enrolling}
+                        onChange={(event) => setEnrollmentToken(event.target.value)} />
+                      <button className="btn-primary" type="submit" disabled={p.enrolling}>
+                        {p.enrolling ? "Registering device..." : "Get Remote ID"}
+                      </button>
+                    </form>
                   )}
                   <div className="device-bottom">
                     <div className="device-host">
@@ -448,7 +478,7 @@ export function DesktopHub(p: Props) {
                     >
                       <span className="status-indicator" />
                       {validIdentity
-                        ? "Ready"
+                        ? "Registered"
                         : p.isNative
                           ? "Unavailable"
                           : "Preview"}
@@ -541,7 +571,7 @@ export function DesktopHub(p: Props) {
                       </div>
                       <div>
                         <dt>Remote ID</dt>
-                        <dd>{p.remoteId}</dd>
+                        <dd>{formattedIdentity ?? "Not registered"}</dd>
                       </div>
                       <div>
                         <dt>Environment</dt>

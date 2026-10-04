@@ -3,6 +3,7 @@ import { DesktopHub } from "./DesktopHub";
 import { RemoteCanvas } from "./RemoteCanvas";
 import { ShieldAlert, Wifi, X, Maximize2, Lock } from "lucide-react";
 import { SessionCapabilities, SessionState } from "@krypton/shared-types";
+import { formatRemoteId } from "./remoteIdentity";
 
 interface RecentDevice {
   id: string;
@@ -50,7 +51,9 @@ export default function App() {
   const [isElevated, setIsElevated] = useState<boolean>(false);
   const [monitorCount, setMonitorCount] = useState<number>(1);
 
-  const [myRemoteId, setMyRemoteId] = useState<string>("Generating...");
+  const [myRemoteId, setMyRemoteId] = useState<string>("Loading...");
+  const [identityError, setIdentityError] = useState("");
+  const [enrolling, setEnrolling] = useState(false);
   const [myDeviceName, setMyDeviceName] = useState<string>("Local Host");
 
   // State: Incoming Support Request on Host (Section 10)
@@ -87,20 +90,16 @@ export default function App() {
       try {
         const { invoke } = await import("@tauri-apps/api/core");
         try {
-          const id = await invoke<string>("initialize_identity");
-          if (id) {
-            const clean = id.replace(/[^a-zA-Z0-9]/g, "");
-            if (clean.length === 9) {
-              setMyRemoteId(
-                `${clean.slice(0, 3)} ${clean.slice(3, 6)} ${clean.slice(6)}`,
-              );
-            } else {
-              setMyRemoteId(id);
-            }
+          const id = await invoke<string | null>("initialize_identity");
+          const formatted = formatRemoteId(id);
+          setMyRemoteId(formatted ?? "Registration required");
+          if (id !== null && !formatted) {
+            setIdentityError("No valid Remote ID was returned. Register this device with your API server.");
           }
         } catch (idErr) {
           console.warn("Device identity initialize fallback:", idErr);
           setMyRemoteId("Unavailable");
+          setIdentityError(typeof idErr === "string" ? idErr : "Could not load this device's registration.");
         }
 
         const telemetry = await invoke<any>("get_windows_telemetry");
@@ -117,9 +116,28 @@ export default function App() {
     })();
   }, []);
 
-  const handleCopyId = async () => {
+  const handleEnroll = async (apiUrl: string, enrollmentToken: string) => {
+    if (!isNative || enrolling) return;
+    setEnrolling(true);
+    setIdentityError("");
     try {
-      await navigator.clipboard.writeText(myRemoteId.replace(/\s+/g, ""));
+      const { invoke } = await import("@tauri-apps/api/core");
+      const id = await invoke<string>("enroll_device", { apiUrl, enrollmentToken });
+      const formatted = formatRemoteId(id);
+      if (!formatted) throw new Error("The server did not return a valid 9-digit Remote ID.");
+      setMyRemoteId(formatted);
+    } catch (error) {
+      setIdentityError(typeof error === "string" ? error : error instanceof Error ? error.message : "Could not register this device.");
+    } finally {
+      setEnrolling(false);
+    }
+  };
+
+  const handleCopyId = async () => {
+    const formatted = formatRemoteId(myRemoteId);
+    if (!formatted) return;
+    try {
+      await navigator.clipboard.writeText(formatted.replace(/\s/g, ""));
       setCopyError("");
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
@@ -515,6 +533,9 @@ export default function App() {
         activeTab={activeTab}
         onTabChange={setActiveTab}
         remoteId={myRemoteId}
+        identityError={identityError}
+        enrolling={enrolling}
+        onEnroll={handleEnroll}
         deviceName={myDeviceName}
         isElevated={isElevated}
         monitorCount={monitorCount}

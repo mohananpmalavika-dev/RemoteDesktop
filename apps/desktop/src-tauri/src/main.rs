@@ -20,6 +20,26 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 use serde::{Deserialize, Serialize};
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnrolledIdentity {
+    device_id: String,
+    remote_id: String,
+    public_key_base64: String,
+    api_url: String,
+}
+
+fn identity_directory(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path().app_local_data_dir().map_err(|e| e.to_string())
+}
+
+fn prepare_identity(app: &AppHandle, engine: &mut RemoteEngine) -> Result<String, String> {
+    #[cfg(windows)]
+    { engine.initialize_persisted_identity(&identity_directory(app)?.join("device-key.dpapi")) }
+    #[cfg(not(windows))]
+    { let _ = app; engine.initialize_identity() }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Desktop Modes & Application State
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,9 +99,95 @@ fn get_engine_state(state: State<AppState>) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn initialize_identity(state: State<AppState>) -> Result<String, String> {
+fn initialize_identity(app: AppHandle, state: State<AppState>) -> Result<Option<String>, String> {
     let mut engine = state.engine.lock().map_err(|e| e.to_string())?;
-    engine.initialize_identity()
+    let public_key = prepare_identity(&app, &mut engine)?;
+    let path = identity_directory(&app)?.join("enrolled-device.json");
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let saved: EnrolledIdentity = serde_json::from_slice(&bytes)
+                .map_err(|_| "Saved device registration is invalid.".to_string())?;
+            if saved.public_key_base64 != public_key {
+                return Err("Saved registration does not match this device identity.".into());
+            }
+            let remote_id = krypton_remote_core::format_remote_id(&saved.remote_id)?;
+            engine.set_enrolled_identity(saved.device_id, remote_id);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err("Could not read saved device registration.".into()),
+    }
+    engine.shareable_remote_id()
+}
+
+#[tauri::command]
+async fn enroll_device(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    api_url: String,
+    enrollment_token: String,
+) -> Result<String, String> {
+    if enrollment_token.trim().is_empty() {
+        return Err("Enter the device enrollment token from your administrator.".into());
+    }
+    let mut url = reqwest::Url::parse(api_url.trim())
+        .map_err(|_| "Enter a valid API URL, including https://.".to_string())?;
+    let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if url.scheme() != "https" && !(url.scheme() == "http" && local) {
+        return Err("Use HTTPS for your API server, or HTTP for localhost development.".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
+        return Err("API URL must not contain credentials, a query, or a fragment.".into());
+    }
+    let base_path = url.path().trim_end_matches('/');
+    let enrollment_path = if base_path.is_empty() {
+        "/api/v1/devices/enroll".to_string()
+    } else {
+        format!("{base_path}/devices/enroll")
+    };
+    url.set_path(&enrollment_path);
+    let request = {
+        let mut engine = state.engine.lock().map_err(|e| e.to_string())?;
+        if let Some(id) = engine.shareable_remote_id()? { return Ok(id); }
+        prepare_identity(&app, &mut engine)?;
+        let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows device".into());
+        engine.create_enrollment_request(enrollment_token.trim(), &name)?
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build().map_err(|_| "Could not initialize the registration client.".to_string())?;
+    let response = client.post(url).json(&request).send().await
+        .map_err(|_| "Could not reach the API server. Check its URL and network connection.".to_string())?;
+    if !response.status().is_success() {
+        return Err(match response.status().as_u16() {
+            400 | 403 => "Registration rejected. Check that the enrollment token is valid, unused, and unexpired.".into(),
+            404 => "Enrollment endpoint not found. Check the API URL (for example https://server/api/v1).".into(),
+            status => format!("Device registration failed (HTTP {status})."),
+        });
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct EnrollmentResponse { device_id: String, remote_id: String }
+    let result: EnrollmentResponse = response.json().await
+        .map_err(|_| "The API returned an invalid device registration response.".to_string())?;
+    if result.device_id.trim().is_empty() { return Err("The API returned an empty device ID.".into()); }
+    let remote_id = krypton_remote_core::format_remote_id(&result.remote_id)?;
+    let saved = EnrolledIdentity {
+        device_id: result.device_id.clone(), remote_id: remote_id.clone(),
+        public_key_base64: request.public_key_base64, api_url: api_url.trim().to_string(),
+    };
+    let directory = identity_directory(&app)?;
+    let bytes = serde_json::to_vec(&saved).map_err(|e| e.to_string())?;
+    let persist = (|| -> Result<(), std::io::Error> {
+        std::fs::create_dir_all(&directory)?;
+        let pending = directory.join("enrolled-device.json.pending");
+        std::fs::write(&pending, bytes)?;
+        std::fs::rename(pending, directory.join("enrolled-device.json"))
+    })();
+    state.engine.lock().map_err(|e| e.to_string())?
+        .set_enrolled_identity(result.device_id, remote_id.clone());
+    persist.map_err(|_| "Device registered, but could not save its ID. Keep this app open and check local storage permissions.".to_string())?;
+    Ok(remote_id)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -698,6 +804,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_engine_state,
             initialize_identity,
+            enroll_device,
             get_capture_displays,
             start_capture,
             stop_capture,
