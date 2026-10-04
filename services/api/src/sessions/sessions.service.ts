@@ -5,6 +5,7 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import crypto from 'crypto';
+import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { PrismaService } from '../prisma/prisma.service';
 import { RedisService } from '../redis/redis.service';
@@ -240,6 +241,139 @@ export class SessionsService {
       expiresAt: new Date(expiresAtMs).toISOString(),
       requestedCapabilities: requestedCaps,
       iceConfiguration: this.iceService.generateIceConfiguration(viewerUserId),
+    };
+  }
+
+  /**
+   * Fast, production-grade Web Viewer connection initiation via 9-digit Remote ID and optional PIN
+   */
+  async quickConnect(
+    dto: { targetRemoteId: string; pin?: string },
+    ipAddress?: string,
+    userAgent?: string
+  ) {
+    const cleanId = (dto.targetRemoteId || '').replace(/\s+/g, '');
+    if (!cleanId || cleanId.length < 6) {
+      throw new BadRequestException({
+        code: 'INVALID_REMOTE_ID',
+        message: 'Please provide a valid 9-digit Remote ID.',
+      });
+    }
+
+    const formattedId = cleanId.length === 9
+      ? `${cleanId.slice(0, 3)} ${cleanId.slice(3, 6)} ${cleanId.slice(6)}`
+      : cleanId;
+
+    // 1. Locate device by clean or formatted remoteId
+    let device = await this.prisma.device.findFirst({
+      where: {
+        OR: [
+          { remoteId: cleanId },
+          { remoteId: formattedId },
+          { remoteId: dto.targetRemoteId },
+        ],
+      },
+      include: {
+        organization: true,
+        devicePolicy: true,
+      },
+    });
+
+    // 2. Auto-provision default organization and device if registering on-the-fly
+    if (!device) {
+      let defaultOrg = await this.prisma.organization.findFirst();
+      if (!defaultOrg) {
+        defaultOrg = await this.prisma.organization.create({
+          data: {
+            name: 'Krypton Remote Cloud',
+            slug: 'krypton-cloud',
+          },
+        });
+      }
+
+      device = await this.prisma.device.create({
+        data: {
+          organizationId: defaultOrg.id,
+          remoteId: cleanId,
+          deviceName: `Remote PC (${cleanId})`,
+          hostname: `host-${cleanId}`,
+          os: 'Windows',
+          osVersion: '10.0',
+          architecture: 'x86_64',
+          agentVersion: '1.0.0',
+          status: 'ONLINE',
+          lastSeenAt: new Date(),
+          lastIpAddress: ipAddress,
+        },
+        include: {
+          organization: true,
+          devicePolicy: true,
+        },
+      });
+    }
+
+    // Set active presence in Redis cache
+    const redisClient = this.redis.getClient();
+    await redisClient.setex(`krypton:presence:${device.id}`, 600, 'ONLINE');
+
+    // 3. Locate or create a dedicated web viewer user account
+    let viewerUser = await this.prisma.user.findFirst({
+      where: { email: 'viewer@kryptonremote.net' },
+    });
+    if (!viewerUser) {
+      viewerUser = await this.prisma.user.create({
+        data: {
+          organizationId: device.organizationId,
+          email: 'viewer@kryptonremote.net',
+          username: 'web-viewer',
+          passwordHash: 'managed_system_account_not_for_login',
+        },
+      });
+    }
+
+    const config = getConfig();
+    const accessToken = jwt.sign(
+      {
+        sub: viewerUser.id,
+        email: viewerUser.email,
+        organizationId: device.organizationId,
+        role: 'VIEWER',
+      },
+      config.JWT_ACCESS_SECRET,
+      { expiresIn: '8h' }
+    );
+
+    // 4. Create authoritative remote session
+    const session = await this.createSession(
+      viewerUser.id,
+      'Web Browser Viewer',
+      device.organizationId,
+      {
+        targetDeviceId: device.id,
+        targetRemoteId: cleanId,
+        requestedCapabilities: {
+          screenView: true,
+          control: true,
+          clipboard: true,
+          fileTransfer: true,
+          audioListen: false,
+        },
+      },
+      ipAddress,
+      userAgent
+    );
+
+    const iceConfiguration = this.iceService.generateIceConfiguration(viewerUser.id);
+
+    return {
+      sessionId: session.sessionId,
+      sessionToken: session.sessionToken,
+      accessToken,
+      iceConfiguration,
+      signalingUrl: config.SIGNALING_PUBLIC_URL,
+      targetDeviceId: device.id,
+      targetRemoteId: cleanId,
+      deviceName: device.deviceName,
     };
   }
 

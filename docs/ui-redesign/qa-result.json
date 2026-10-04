@@ -1,0 +1,15 @@
+{
+  "passed": true,
+  "checks": [
+    "desktop tabs",
+    "ID validation",
+    "browser preview connection feedback",
+    "help guide",
+    "saved device search and reconnect",
+    "native bridge fixture: identity, copy ID, connection failure",
+    "desktop layout at 1440, 1100, 900 and 390 pixels",
+    "admin tabs",
+    "admin mobile layout",
+    "no browser page errors"
+  ]
+}

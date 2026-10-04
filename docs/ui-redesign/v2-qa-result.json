@@ -1,0 +1,16 @@
+{
+  "passed": true,
+  "checks": [
+    "nine-digit ID validation without API submission",
+    "PIN visibility",
+    "formatted ID and PIN request with mocked offline response",
+    "error and return-to-form flow",
+    "URL-prefilled Remote ID",
+    "all admin tabs",
+    "all desktop tabs",
+    "desktop validation and preview error",
+    "responsive layouts at 1440, 1100, 900, 390 pixels",
+    "no uncaught page errors"
+  ],
+  "limitations": "UI tests use mocked admin responses. Live remote transport not exercised."
+}

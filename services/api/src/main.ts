@@ -1,4 +1,7 @@
 import { NestFactory } from '@nestjs/core';
+import fs from 'fs';
+import path from 'path';
+import express from 'express';
 import { AppModule } from './app.module';
 import { getConfig } from '@krypton/config';
 import { createLogger } from '@krypton/logger';
@@ -40,6 +43,28 @@ async function bootstrap() {
       origin: true,
       credentials: true,
     });
+  }
+
+  // Serve static assets if public directory exists (production Web Viewer & Admin Console)
+  const candidateDirs = [
+    path.resolve(process.cwd(), 'public'),
+    path.resolve(__dirname, '..', '..', 'public'),
+    path.resolve(__dirname, '..', 'public'),
+    path.resolve(process.cwd(), 'apps', 'admin-web', 'dist'),
+  ];
+  const publicDir = candidateDirs.find((dir) => fs.existsSync(dir));
+  if (publicDir) {
+    const expressApp = app.getHttpAdapter().getInstance();
+    expressApp.use(express.static(publicDir));
+    // SPA fallback
+    expressApp.use((req: any, res: any, next: () => void) => {
+      if (req.method === 'GET' && !req.path.startsWith('/api') && !req.path.startsWith('/health')) {
+        res.sendFile(path.join(publicDir, 'index.html'));
+      } else {
+        next();
+      }
+    });
+    logger.info(`Static frontend assets served from ${publicDir}`);
   }
 
   await app.listen(config.API_PORT, config.API_HOST);

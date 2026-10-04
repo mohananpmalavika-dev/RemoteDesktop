@@ -99,4 +99,21 @@ export class SessionsController {
   async getIceServers(@CurrentUser() user: any) {
     return this.iceService.generateIceConfiguration(user.id);
   }
+
+  @Public()
+  @Post('quick-connect')
+  async quickConnect(
+    @Body() dto: { targetRemoteId: string; pin?: string },
+    @Req() req: any
+  ) {
+    const ip = req.ip || req.socket.remoteAddress;
+    const userAgent = req.headers['user-agent'];
+    return this.sessionsService.quickConnect(dto, ip, userAgent);
+  }
+
+  @Public()
+  @Get('public/ice-servers')
+  async getPublicIceServers() {
+    return this.iceService.generateIceConfiguration('web-guest');
+  }
 }

@@ -41,6 +41,7 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/packages ./packages
 COPY --from=builder /app/services/api/dist ./services/api/dist
 COPY --from=builder /app/services/api/package.json ./services/api/package.json
+COPY apps/admin-web/dist ./public
 COPY --from=builder /app/prisma ./prisma
 
 EXPOSE 4000
