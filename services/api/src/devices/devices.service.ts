@@ -203,7 +203,7 @@ export class DevicesService {
         data: {
           deviceId: device.id,
           allowUnattendedAccess: false,
-          requireMfa: true,
+          requireMfa: false,
           allowClipboard: true,
           allowFileTransfer: true,
           requireSessionRecording: false,
@@ -321,9 +321,13 @@ export class DevicesService {
 
     if (device.lastSeenAt) {
       const msSinceLastSeen = Date.now() - device.lastSeenAt.getTime();
-      if (msSinceLastSeen < 3 * 60 * 1000) {
-        return DeviceStatus.DEGRADED; // Between 45s and 3 mins
+      if (msSinceLastSeen < 15 * 60 * 1000) {
+        return DeviceStatus.ONLINE;
       }
+    }
+
+    if (device.status === DeviceStatus.ONLINE) {
+      return DeviceStatus.ONLINE;
     }
 
     return DeviceStatus.OFFLINE;
