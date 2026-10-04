@@ -1,0 +1,41 @@
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copy root and workspace package files
+COPY package*.json ./
+COPY packages/config/package.json ./packages/config/
+COPY packages/logger/package.json ./packages/logger/
+COPY packages/protocol/package.json ./packages/protocol/
+COPY packages/shared-types/package.json ./packages/shared-types/
+COPY services/signaling/package.json ./services/signaling/
+
+RUN npm ci
+
+COPY packages/ ./packages/
+COPY services/signaling/ ./services/signaling/
+COPY tsconfig.base.json ./
+
+RUN npm run build --workspace=@krypton/shared-types
+RUN npm run build --workspace=@krypton/config
+RUN npm run build --workspace=@krypton/logger
+RUN npm run build --workspace=@krypton/protocol
+RUN npm run build --workspace=@krypton/signaling
+
+# Production runner stage
+FROM node:20-alpine AS runner
+
+WORKDIR /app
+
+COPY package*.json ./
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/packages ./packages
+COPY --from=builder /app/services/signaling/dist ./services/signaling/dist
+COPY --from=builder /app/services/signaling/package.json ./services/signaling/package.json
+
+EXPOSE 4001
+
+ENV NODE_ENV=production
+ENV SIGNALING_PORT=4001
+
+CMD ["node", "services/signaling/dist/main.js"]

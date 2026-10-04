@@ -1,0 +1,51 @@
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Install build tools for native compilation
+RUN apk add --no-cache python3 make g++
+
+# Copy root and workspace package files
+COPY package*.json ./
+COPY packages/config/package.json ./packages/config/
+COPY packages/logger/package.json ./packages/logger/
+COPY packages/protocol/package.json ./packages/protocol/
+COPY packages/shared-types/package.json ./packages/shared-types/
+COPY services/api/package.json ./services/api/
+COPY prisma/ ./prisma/
+
+# Install dependencies and generate Prisma client
+RUN npm ci
+RUN npx prisma generate --schema=prisma/schema.prisma
+
+# Copy source code and build
+COPY packages/ ./packages/
+COPY services/api/ ./services/api/
+COPY tsconfig.base.json ./
+
+RUN npm run build --workspace=@krypton/shared-types
+RUN npm run build --workspace=@krypton/config
+RUN npm run build --workspace=@krypton/logger
+RUN npm run build --workspace=@krypton/protocol
+RUN npm run build --workspace=@krypton/api
+
+# Production runner stage
+FROM node:20-alpine AS runner
+
+WORKDIR /app
+
+RUN apk add --no-cache openssl
+
+COPY package*.json ./
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/packages ./packages
+COPY --from=builder /app/services/api/dist ./services/api/dist
+COPY --from=builder /app/services/api/package.json ./services/api/package.json
+COPY --from=builder /app/prisma ./prisma
+
+EXPOSE 4000
+
+ENV NODE_ENV=production
+ENV API_PORT=4000
+
+CMD ["node", "services/api/dist/main.js"]
