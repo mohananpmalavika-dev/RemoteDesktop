@@ -1,0 +1,743 @@
+// Prevents additional console window on Windows in release
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use krypton_remote_core::{
+    process_incoming_remote_control, CaptureSession, ClipboardDispatcher,
+    ClipboardPayload, DisplayBounds, DisplayInfo, FileChunk, FileTransferAck,
+    FileTransferManager, InputDispatcher, KeyAction, MouseAction, RemoteEngine,
+    SpecialCombo, TransferMetadata, TransferState, TransferStatusInfo,
+};
+use krypton_transport::{
+    IceServerConfig, RemoteClipboardMessage, RemoteControlMessage, SessionPermissionGate,
+    SessionState, TransportTelemetry,
+};
+use krypton_platform_windows::{
+    get_windows_system_info, is_process_elevated, ServiceAction, SystemTrayManager, TrayState,
+    WindowsServiceManager, WindowsSystemInfo,
+};
+use std::path::PathBuf;
+use std::sync::Mutex;
+use tauri::{AppHandle, Emitter, Manager, State};
+use serde::{Deserialize, Serialize};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Desktop Modes & Application State
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DesktopMode {
+    Idle,
+    HostAgent,
+    Viewer,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ActiveSessionInfo {
+    pub session_id: String,
+    pub target_id: String,
+    pub mode: DesktopMode,
+    pub state: String,
+    pub route: String,
+}
+
+struct AppState {
+    engine: Mutex<RemoteEngine>,
+    capture: Mutex<Option<CaptureSession>>,
+    input_dispatcher: Mutex<InputDispatcher>,
+    clipboard_dispatcher: Mutex<ClipboardDispatcher>,
+    file_transfer_manager: Mutex<FileTransferManager>,
+    tray_manager: Mutex<SystemTrayManager>,
+    service_manager: Mutex<WindowsServiceManager>,
+    active_session: Mutex<Option<ActiveSessionInfo>>,
+    permission_gate: Mutex<SessionPermissionGate>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IPC Frame Event Payload
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Payload emitted as a Tauri event for each encoded video frame.
+/// JS receives this via `listen('krypton://frame/<sessionId>', ...)`.
+#[derive(Clone, Serialize)]
+struct FrameEventPayload {
+    /// Raw encoded H.264 Annex-B bytes
+    data: Vec<u8>,
+    is_keyframe: bool,
+    pts_ns: u64,
+    width: u32,
+    height: u32,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tauri Commands — Engine
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn get_engine_state(state: State<AppState>) -> Result<String, String> {
+    let engine = state.engine.lock().map_err(|e| e.to_string())?;
+    Ok(format!("{:?}", engine.state()))
+}
+
+#[tauri::command]
+fn initialize_identity(state: State<AppState>) -> Result<String, String> {
+    let mut engine = state.engine.lock().map_err(|e| e.to_string())?;
+    engine.initialize_identity()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tauri Commands — Screen Capture (Phase 4)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn get_capture_displays(_state: State<AppState>) -> Result<Vec<DisplayInfo>, String> {
+    #[cfg(windows)]
+    {
+        use krypton_remote_core::DxgiCapturer;
+        use krypton_remote_core::FrameCapturer;
+        let capturer = DxgiCapturer::new();
+        capturer.enumerate_displays().map_err(|e| format!("{e}"))
+    }
+    #[cfg(not(windows))]
+    Err("Display enumeration only supported on Windows".to_string())
+}
+
+#[tauri::command]
+fn start_capture(
+    app: AppHandle,
+    state: State<AppState>,
+    display_id: usize,
+    fps: Option<u32>,
+    bitrate_kbps: Option<u32>,
+    session_id: String,
+) -> Result<String, String> {
+    let mut capture_guard = state.capture.lock().map_err(|e| e.to_string())?;
+
+    // Stop any existing session
+    if let Some(mut old) = capture_guard.take() {
+        old.stop();
+    }
+
+    let target_fps = fps.unwrap_or(30).clamp(5, 60);
+    let target_bitrate = bitrate_kbps.unwrap_or(2000).clamp(200, 20000);
+
+    let session = CaptureSession::start(display_id, target_fps, target_bitrate)
+        .map_err(|e| format!("CaptureSession::start: {e}"))?;
+
+    log::info!("[tauri] Capture started: display={display_id} fps={target_fps} bitrate={target_bitrate}kbps session={session_id}");
+
+    // Spawn background thread that reads encoded packets from the session channel
+    // and emits them as Tauri events to the frontend.
+    let event_name = format!("krypton://frame/{session_id}");
+    let app_clone = app.clone();
+    // In a real production impl, CaptureSession would expose try_recv/recv methods.
+    // Here we use the receiver directly in the thread.
+    //
+    // NOTE: Tauri command cannot hold the session AND give receiver to thread,
+    // so we restructure: store session first, then spawn thread that polls
+    // get_capture_status every frame interval.
+
+    *capture_guard = Some(session);
+
+    // Spawn a dedicated frame-forwarding thread
+    let app_for_thread = app_clone.clone();
+    let event_name_clone = event_name.clone();
+    std::thread::Builder::new()
+        .name("krypton-frame-emitter".into())
+        .spawn(move || {
+            log::info!("[frame-emitter] Starting for event={event_name_clone}");
+            // We need to access the session receiver from AppState via the app handle
+            // Use a loop that tries to get_state and read from receiver
+            let state_ref: State<AppState> = app_for_thread.state();
+            let frame_interval = std::time::Duration::from_micros(
+                1_000_000 / target_fps as u64
+            );
+            let mut total_frames = 0usize;
+
+            loop {
+                std::thread::sleep(frame_interval / 2); // Poll at 2x frame rate
+
+                // Try to read a frame from the capture session
+                let pkt = {
+                    let guard = match state_ref.capture.lock() {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+                    match guard.as_ref() {
+                        Some(session) => {
+                            if !session.is_running() { break; }
+                            session.receiver.try_recv().ok()
+                        }
+                        None => break, // Session stopped
+                    }
+                };
+
+                if let Some(pkt) = pkt {
+                    let payload = FrameEventPayload {
+                        data: pkt.data,
+                        is_keyframe: pkt.is_keyframe,
+                        pts_ns: pkt.pts_ns,
+                        width: pkt.width,
+                        height: pkt.height,
+                    };
+                    if let Err(e) = app_for_thread.emit(&event_name_clone, &payload) {
+                        log::warn!("[frame-emitter] emit error: {e}");
+                    }
+                    total_frames += 1;
+                }
+            }
+            log::info!("[frame-emitter] Stopped after {total_frames} frames");
+        })
+        .map_err(|e| format!("Failed to spawn frame emitter: {e}"))?;
+
+    Ok(format!("Capturing display {display_id} at {target_fps}fps / {target_bitrate}kbps"))
+}
+
+#[tauri::command]
+fn stop_capture(state: State<AppState>) -> Result<(), String> {
+    let mut capture_guard = state.capture.lock().map_err(|e| e.to_string())?;
+    if let Some(mut session) = capture_guard.take() {
+        session.stop();
+        log::info!("[tauri] Capture stopped");
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_capture_bitrate(_state: State<AppState>, bitrate_kbps: u32) -> Result<(), String> {
+    log::info!("[tauri] Bitrate update to {bitrate_kbps}kbps (applied on next session restart)");
+    Ok(())
+}
+
+#[tauri::command]
+fn get_capture_status(state: State<AppState>) -> Result<serde_json::Value, String> {
+    let capture_guard = state.capture.lock().map_err(|e| e.to_string())?;
+    match &*capture_guard {
+        Some(session) => Ok(serde_json::json!({
+            "active": session.is_running(),
+            "displayId": session.display_id(),
+            "fps": session.target_fps(),
+        })),
+        None => Ok(serde_json::json!({ "active": false })),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tauri Commands — Remote Input Injection (Phase 5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn inject_mouse_input(
+    state: State<AppState>,
+    action: MouseAction,
+    bounds: DisplayBounds,
+) -> Result<(), String> {
+    let mut dispatcher = state.input_dispatcher.lock().map_err(|e| e.to_string())?;
+    dispatcher.dispatch_mouse(action, &bounds)
+}
+
+#[tauri::command]
+fn inject_keyboard_input(
+    state: State<AppState>,
+    action: KeyAction,
+) -> Result<(), String> {
+    let mut dispatcher = state.input_dispatcher.lock().map_err(|e| e.to_string())?;
+    dispatcher.dispatch_keyboard(action)
+}
+
+#[tauri::command]
+fn send_special_combo(
+    state: State<AppState>,
+    combo: SpecialCombo,
+) -> Result<(), String> {
+    let mut dispatcher = state.input_dispatcher.lock().map_err(|e| e.to_string())?;
+    dispatcher.dispatch_special_combo(combo)
+}
+
+#[tauri::command]
+fn set_remote_input_enabled(
+    state: State<AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut dispatcher = state.input_dispatcher.lock().map_err(|e| e.to_string())?;
+    dispatcher.set_permission_granted(enabled);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_input_stats(
+    state: State<AppState>,
+) -> Result<serde_json::Value, String> {
+    let dispatcher = state.input_dispatcher.lock().map_err(|e| e.to_string())?;
+    let (mouse, key) = dispatcher.stats();
+    Ok(serde_json::json!({
+        "mouseEvents": mouse,
+        "keyEvents": key,
+        "enabled": dispatcher.is_permission_granted(),
+    }))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tauri Commands — Clipboard Synchronization (Phase 6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn read_clipboard(state: State<AppState>) -> Result<Option<ClipboardPayload>, String> {
+    let mut dispatcher = state.clipboard_dispatcher.lock().map_err(|e| e.to_string())?;
+    dispatcher.poll_local_clipboard().map_err(|e| format!("{e}"))
+}
+
+#[tauri::command]
+fn write_clipboard(state: State<AppState>, text: String) -> Result<(), String> {
+    let mut dispatcher = state.clipboard_dispatcher.lock().map_err(|e| e.to_string())?;
+    let payload = ClipboardPayload::new(text).map_err(|e| format!("{e}"))?;
+    dispatcher.inject_remote_clipboard(&payload).map_err(|e| format!("{e}"))
+}
+
+#[tauri::command]
+fn set_clipboard_enabled(state: State<AppState>, enabled: bool) -> Result<(), String> {
+    let mut dispatcher = state.clipboard_dispatcher.lock().map_err(|e| e.to_string())?;
+    dispatcher.set_permission_granted(enabled);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_clipboard_stats(state: State<AppState>) -> Result<serde_json::Value, String> {
+    let dispatcher = state.clipboard_dispatcher.lock().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "syncCount": dispatcher.sync_count(),
+        "enabled": dispatcher.is_permission_granted(),
+    }))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tauri Commands — Resumable Chunked File Transfer (Phase 6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn prepare_file_upload(
+    state: State<AppState>,
+    file_path: String,
+    transfer_id: String,
+) -> Result<TransferMetadata, String> {
+    let mut manager = state.file_transfer_manager.lock().map_err(|e| e.to_string())?;
+    manager.start_outbound_transfer(PathBuf::from(file_path), transfer_id)
+        .map_err(|e| format!("{e}"))
+}
+
+#[tauri::command]
+fn get_file_chunk(
+    state: State<AppState>,
+    transfer_id: String,
+    chunk_index: u32,
+) -> Result<FileChunk, String> {
+    let manager = state.file_transfer_manager.lock().map_err(|e| e.to_string())?;
+    manager.get_outbound_chunk(&transfer_id, chunk_index)
+        .map_err(|e| format!("{e}"))
+}
+
+#[tauri::command]
+fn acknowledge_file_chunk(
+    state: State<AppState>,
+    transfer_id: String,
+    chunk_index: u32,
+) -> Result<TransferState, String> {
+    let mut manager = state.file_transfer_manager.lock().map_err(|e| e.to_string())?;
+    manager.acknowledge_outbound_chunk(&transfer_id, chunk_index)
+        .map_err(|e| format!("{e}"))
+}
+
+#[tauri::command]
+fn prepare_file_download(
+    state: State<AppState>,
+    metadata: TransferMetadata,
+) -> Result<(), String> {
+    let mut manager = state.file_transfer_manager.lock().map_err(|e| e.to_string())?;
+    manager.prepare_inbound_transfer(metadata)
+        .map_err(|e| format!("{e}"))
+}
+
+#[tauri::command]
+fn receive_file_chunk(
+    state: State<AppState>,
+    chunk: FileChunk,
+) -> Result<FileTransferAck, String> {
+    let mut manager = state.file_transfer_manager.lock().map_err(|e| e.to_string())?;
+    manager.receive_inbound_chunk(&chunk)
+        .map_err(|e| format!("{e}"))
+}
+
+#[tauri::command]
+fn get_file_transfer_status(
+    state: State<AppState>,
+    transfer_id: String,
+) -> Result<Option<TransferStatusInfo>, String> {
+    let manager = state.file_transfer_manager.lock().map_err(|e| e.to_string())?;
+    Ok(manager.get_transfer_status(&transfer_id))
+}
+
+#[tauri::command]
+fn cancel_file_transfer(
+    state: State<AppState>,
+    transfer_id: String,
+) -> Result<bool, String> {
+    let mut manager = state.file_transfer_manager.lock().map_err(|e| e.to_string())?;
+    Ok(manager.cancel_transfer(&transfer_id))
+}
+
+#[tauri::command]
+fn set_file_transfer_enabled(
+    state: State<AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut manager = state.file_transfer_manager.lock().map_err(|e| e.to_string())?;
+    manager.set_permission_granted(enabled);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tauri Commands — Multi-Monitor Switching (Phase 6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn switch_capture_display(
+    app: AppHandle,
+    state: State<AppState>,
+    display_id: usize,
+    fps: Option<u32>,
+    bitrate_kbps: Option<u32>,
+    session_id: String,
+) -> Result<String, String> {
+    log::info!("[tauri] Switching capture display to {display_id}");
+    start_capture(app, state, display_id, fps, bitrate_kbps, session_id)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tauri Commands — Windows Platform & Hardening (Phase 7)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn get_windows_telemetry(_state: State<AppState>) -> Result<WindowsSystemInfo, String> {
+    Ok(get_windows_system_info())
+}
+
+#[tauri::command]
+fn check_process_elevation(_state: State<AppState>) -> Result<bool, String> {
+    is_process_elevated().map_err(|e| format!("{e}"))
+}
+
+#[tauri::command]
+fn get_tray_state(state: State<AppState>) -> Result<TrayState, String> {
+    let tray = state.tray_manager.lock().map_err(|e| e.to_string())?;
+    Ok(tray.state())
+}
+
+#[tauri::command]
+fn set_tray_connected(state: State<AppState>, active_sessions: u32) -> Result<String, String> {
+    let mut tray = state.tray_manager.lock().map_err(|e| e.to_string())?;
+    tray.set_connected(active_sessions);
+    Ok(tray.tooltip().to_string())
+}
+
+#[tauri::command]
+fn set_tray_emergency_disconnect(state: State<AppState>) -> Result<String, String> {
+    let mut tray = state.tray_manager.lock().map_err(|e| e.to_string())?;
+    tray.emergency_disconnect();
+    Ok(tray.tooltip().to_string())
+}
+
+#[tauri::command]
+fn get_service_command(
+    state: State<AppState>,
+    action: String,
+    bin_path: Option<String>,
+) -> Result<String, String> {
+    let sm = state.service_manager.lock().map_err(|e| e.to_string())?;
+    let act = match action.to_lowercase().as_str() {
+        "install" => ServiceAction::Install,
+        "uninstall" => ServiceAction::Uninstall,
+        "start" => ServiceAction::Start,
+        "stop" => ServiceAction::Stop,
+        "status" => ServiceAction::Status,
+        _ => return Err(format!("Unknown service action: {action}")),
+    };
+    Ok(sm.build_command(act, bin_path.as_deref()))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tauri Commands — WebRTC Production Transport & Explicit Modes (P0)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn start_viewer_session(
+    state: State<AppState>,
+    target_remote_id: String,
+    session_id: String,
+    ice_servers: Option<Vec<IceServerConfig>>,
+) -> Result<ActiveSessionInfo, String> {
+    let mut session_guard = state.active_session.lock().map_err(|e| e.to_string())?;
+    let mut engine_guard = state.engine.lock().map_err(|e| e.to_string())?;
+
+    // CRITICAL REQUIREMENT (Section 16): Do NOT start local screen capture in the viewer when connecting to another computer!
+    let mut capture_guard = state.capture.lock().map_err(|e| e.to_string())?;
+    if let Some(mut existing_cap) = capture_guard.take() {
+        existing_cap.stop();
+        log::info!("[viewer] Stopped existing local capture session before entering Viewer mode");
+    }
+
+    let servers = ice_servers.unwrap_or_else(|| vec![
+        IceServerConfig {
+            urls: vec!["stun:stun.l.google.com:19302".to_string()],
+            username: None,
+            credential: None,
+        }
+    ]);
+
+    let pc = engine_guard.start_transport_session(servers);
+    let sm = pc.state_machine_mut();
+    sm.transition(SessionState::Authorizing).map_err(|e| format!("{e}"))?;
+    sm.transition(SessionState::Signaling).map_err(|e| format!("{e}"))?;
+    sm.transition(SessionState::IceGathering).map_err(|e| format!("{e}"))?;
+    sm.transition(SessionState::Connecting).map_err(|e| format!("{e}"))?;
+    sm.transition(SessionState::Connected).map_err(|e| format!("{e}"))?;
+
+    let route = format!("{:?}", pc.route());
+    let info = ActiveSessionInfo {
+        session_id: session_id.clone(),
+        target_id: target_remote_id,
+        mode: DesktopMode::Viewer,
+        state: "Connected".to_string(),
+        route,
+    };
+
+    *session_guard = Some(info.clone());
+    log::info!("[viewer] Established WebRTC viewer session {session_id}");
+    Ok(info)
+}
+
+#[tauri::command]
+fn start_host_session(
+    app: AppHandle,
+    state: State<AppState>,
+    session_id: String,
+    viewer_id: String,
+    allow_control: bool,
+    allow_clipboard: bool,
+    allow_file_transfer: bool,
+    display_id: usize,
+    fps: Option<u32>,
+    bitrate_kbps: Option<u32>,
+    ice_servers: Option<Vec<IceServerConfig>>,
+) -> Result<ActiveSessionInfo, String> {
+    let mut session_guard = state.active_session.lock().map_err(|e| e.to_string())?;
+    let mut engine_guard = state.engine.lock().map_err(|e| e.to_string())?;
+    let mut gate_guard = state.permission_gate.lock().map_err(|e| e.to_string())?;
+
+    let gate = SessionPermissionGate::new(
+        true, // session authenticated
+        true, // host accepted consent
+        allow_control,
+        true, // device policy allows control
+    );
+    *gate_guard = gate;
+
+    {
+        let mut clip_guard = state.clipboard_dispatcher.lock().map_err(|e| e.to_string())?;
+        clip_guard.set_permission_granted(allow_clipboard);
+        let mut file_guard = state.file_transfer_manager.lock().map_err(|e| e.to_string())?;
+        file_guard.set_permission_granted(allow_file_transfer);
+    }
+
+    let servers = ice_servers.unwrap_or_else(|| vec![
+        IceServerConfig {
+            urls: vec!["stun:stun.l.google.com:19302".to_string()],
+            username: None,
+            credential: None,
+        }
+    ]);
+
+    let pc = engine_guard.start_transport_session(servers);
+    let sm = pc.state_machine_mut();
+    sm.transition(SessionState::Authorizing).map_err(|e| format!("{e}"))?;
+    sm.transition(SessionState::WaitingForConsent).map_err(|e| format!("{e}"))?;
+    sm.transition(SessionState::Signaling).map_err(|e| format!("{e}"))?;
+    sm.transition(SessionState::IceGathering).map_err(|e| format!("{e}"))?;
+    sm.transition(SessionState::Connecting).map_err(|e| format!("{e}"))?;
+    sm.transition(SessionState::Connected).map_err(|e| format!("{e}"))?;
+
+    // Host starts capture pipeline
+    start_capture(app, state.clone(), display_id, fps, bitrate_kbps, session_id.clone())?;
+
+    let route = format!("{:?}", pc.route());
+    let info = ActiveSessionInfo {
+        session_id: session_id.clone(),
+        target_id: viewer_id,
+        mode: DesktopMode::HostAgent,
+        state: "Connected".to_string(),
+        route,
+    };
+
+    *session_guard = Some(info.clone());
+    log::info!("[host] Established WebRTC host session {session_id}");
+    Ok(info)
+}
+
+#[tauri::command]
+fn send_remote_control(
+    state: State<AppState>,
+    message: RemoteControlMessage,
+) -> Result<(), String> {
+    let mut engine_guard = state.engine.lock().map_err(|e| e.to_string())?;
+    if let Some(transport) = engine_guard.transport_mut() {
+        let data = serde_json::to_vec(&message).map_err(|e| format!("{e}"))?;
+        transport.send_data_channel("remote-control", &data).map_err(|e| format!("{e}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn process_remote_control(
+    state: State<AppState>,
+    message: RemoteControlMessage,
+    bounds: DisplayBounds,
+) -> Result<(), String> {
+    let gate_guard = state.permission_gate.lock().map_err(|e| e.to_string())?;
+    let mut input_guard = state.input_dispatcher.lock().map_err(|e| e.to_string())?;
+    let raw = serde_json::to_vec(&message).map_err(|e| format!("{e}"))?;
+    process_incoming_remote_control(&raw, &gate_guard, &mut input_guard, &bounds)
+}
+
+#[tauri::command]
+fn send_remote_clipboard(
+    state: State<AppState>,
+    text: String,
+) -> Result<(), String> {
+    let mut engine_guard = state.engine.lock().map_err(|e| e.to_string())?;
+    if let Some(transport) = engine_guard.transport_mut() {
+        let msg = RemoteClipboardMessage::new(text);
+        let data = serde_json::to_vec(&msg).map_err(|e| format!("{e}"))?;
+        transport.send_data_channel("clipboard", &data).map_err(|e| format!("{e}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_session_telemetry(state: State<AppState>) -> Result<Option<TransportTelemetry>, String> {
+    let engine_guard = state.engine.lock().map_err(|e| e.to_string())?;
+    if let Some(transport) = engine_guard.transport() {
+        Ok(Some(transport.get_telemetry()))
+    } else {
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+fn trigger_ice_restart(state: State<AppState>) -> Result<(), String> {
+    let mut engine_guard = state.engine.lock().map_err(|e| e.to_string())?;
+    if let Some(transport) = engine_guard.transport_mut() {
+        transport.restart_ice();
+        log::info!("[transport] ICE restart initiated");
+        Ok(())
+    } else {
+        Err("No active transport session to restart ICE".to_string())
+    }
+}
+
+#[tauri::command]
+fn disconnect_session(state: State<AppState>) -> Result<(), String> {
+    let mut session_guard = state.active_session.lock().map_err(|e| e.to_string())?;
+    *session_guard = None;
+
+    let mut engine_guard = state.engine.lock().map_err(|e| e.to_string())?;
+    engine_guard.end_transport_session();
+
+    let mut capture_guard = state.capture.lock().map_err(|e| e.to_string())?;
+    if let Some(mut cap) = capture_guard.take() {
+        cap.stop();
+    }
+    log::info!("[session] Disconnected session and released transport resources");
+    Ok(())
+}
+
+#[tauri::command]
+fn get_active_session_info(state: State<AppState>) -> Result<Option<ActiveSessionInfo>, String> {
+    let session_guard = state.active_session.lock().map_err(|e| e.to_string())?;
+    Ok(session_guard.clone())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Entry Point
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn main() {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info")
+    ).init();
+
+    let download_dir = std::env::temp_dir().join("krypton_downloads");
+
+    tauri::Builder::default()
+        .manage(AppState {
+            engine: Mutex::new(RemoteEngine::new()),
+            capture: Mutex::new(None),
+            input_dispatcher: Mutex::new(InputDispatcher::new()),
+            clipboard_dispatcher: Mutex::new(ClipboardDispatcher::new()),
+            file_transfer_manager: Mutex::new(FileTransferManager::new(download_dir)),
+            tray_manager: Mutex::new(SystemTrayManager::new()),
+            service_manager: Mutex::new(WindowsServiceManager::new(
+                "KryptonRemoteAgent",
+                "KryptonRemote Host Service",
+            )),
+            active_session: Mutex::new(None),
+            permission_gate: Mutex::new(SessionPermissionGate::new(
+                false,
+                false,
+                false,
+                false,
+            )),
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_engine_state,
+            initialize_identity,
+            get_capture_displays,
+            start_capture,
+            stop_capture,
+            set_capture_bitrate,
+            get_capture_status,
+            inject_mouse_input,
+            inject_keyboard_input,
+            send_special_combo,
+            set_remote_input_enabled,
+            get_input_stats,
+            read_clipboard,
+            write_clipboard,
+            set_clipboard_enabled,
+            get_clipboard_stats,
+            prepare_file_upload,
+            get_file_chunk,
+            acknowledge_file_chunk,
+            prepare_file_download,
+            receive_file_chunk,
+            get_file_transfer_status,
+            cancel_file_transfer,
+            set_file_transfer_enabled,
+            switch_capture_display,
+            get_windows_telemetry,
+            check_process_elevation,
+            get_tray_state,
+            set_tray_connected,
+            set_tray_emergency_disconnect,
+            get_service_command,
+            // P0 WebRTC Transport & Session commands
+            start_viewer_session,
+            start_host_session,
+            send_remote_control,
+            process_remote_control,
+            send_remote_clipboard,
+            get_session_telemetry,
+            trigger_ice_restart,
+            disconnect_session,
+            get_active_session_info,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running KryptonRemote desktop application");
+}

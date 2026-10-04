@@ -1,0 +1,21 @@
+[package]
+name = "krypton-remote-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+device-identity = { path = "../device-identity" }
+krypton-input = { path = "../input" }
+krypton-capture = { path = "../capture" }
+krypton-encoder = { path = "../encoder" }
+krypton-clipboard = { path = "../clipboard" }
+krypton-file-transfer = { path = "../file-transfer" }
+krypton-transport = { path = "../transport" }
+krypton-platform-windows = { path = "../platform-windows" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+chrono = "0.4"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+log = "0.4"

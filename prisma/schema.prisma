@@ -1,0 +1,402 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// -----------------------------------------------------------------------------
+// Tenancy, Users & RBAC
+// -----------------------------------------------------------------------------
+
+model Organization {
+  id          String   @id @default(uuid())
+  name        String
+  slug        String   @unique
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  users       User[]
+  devices     Device[]
+  roles       Role[]
+  auditLogs   AuditLog[]
+  enrollmentTokens DeviceEnrollmentToken[]
+
+  @@map("organizations")
+}
+
+model User {
+  id              String         @id @default(uuid())
+  organizationId  String         @map("organization_id")
+  email           String         @unique
+  username        String         @unique
+  passwordHash    String         @map("password_hash")
+  firstName       String?        @map("first_name")
+  lastName        String?        @map("last_name")
+  mfaEnabled      Boolean        @default(false) @map("mfa_enabled")
+  mfaSecret       String?        @map("mfa_secret")
+  status          UserStatus     @default(ACTIVE)
+  lastLoginAt     DateTime?      @map("last_login_at")
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+
+  organization    Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userRoles       UserRole[]
+  userSessions    UserSession[]
+  refreshTokens   RefreshToken[]
+  sessionsAsViewer RemoteSession[] @relation("ViewerSessions")
+
+  @@index([organizationId])
+  @@map("users")
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+  LOCKED
+}
+
+model Role {
+  id              String           @id @default(uuid())
+  organizationId  String           @map("organization_id")
+  name            String
+  description     String?
+  isSystem        Boolean          @default(false) @map("is_system")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+
+  organization    Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  userRoles       UserRole[]
+  rolePermissions RolePermission[]
+
+  @@unique([organizationId, name])
+  @@map("roles")
+}
+
+model Permission {
+  id              String           @id @default(uuid())
+  name            String           @unique
+  description     String?
+  category        String
+  createdAt       DateTime         @default(now()) @map("created_at")
+
+  rolePermissions RolePermission[]
+
+  @@map("permissions")
+}
+
+model UserRole {
+  userId    String   @map("user_id")
+  roleId    String   @map("role_id")
+  assignedAt DateTime @default(now()) @map("assigned_at")
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      Role     @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+  @@map("user_roles")
+}
+
+model RolePermission {
+  roleId       String     @map("role_id")
+  permissionId String     @map("permission_id")
+  grantedAt    DateTime   @default(now()) @map("granted_at")
+
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+// -----------------------------------------------------------------------------
+// Authentication Tokens & Web Sessions
+// -----------------------------------------------------------------------------
+
+model UserSession {
+  id          String   @id @default(uuid())
+  userId      String   @map("user_id")
+  sessionToken String  @unique @map("session_token")
+  ipAddress   String?  @map("ip_address")
+  userAgent   String?  @map("user_agent")
+  expiresAt   DateTime @map("expires_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("user_sessions")
+}
+
+model RefreshToken {
+  id          String   @id @default(uuid())
+  userId      String   @map("user_id")
+  tokenHash   String   @unique @map("token_hash")
+  familyId    String   @map("family_id")
+  isRevoked   Boolean  @default(false) @map("is_revoked")
+  expiresAt   DateTime @map("expires_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+// -----------------------------------------------------------------------------
+// Devices, Identity & Policies
+// -----------------------------------------------------------------------------
+
+model Device {
+  id              String         @id @default(uuid())
+  organizationId  String         @map("organization_id")
+  remoteId        String         @unique @map("remote_id") // Human-friendly locator e.g. "834 951 220"
+  deviceName      String         @map("device_name")
+  alias           String?
+  hostname        String
+  os              String
+  osVersion       String         @map("os_version")
+  architecture    String
+  agentVersion    String         @map("agent_version")
+  status          DeviceStatus   @default(OFFLINE)
+  lastSeenAt      DateTime?      @map("last_seen_at")
+  lastIpAddress   String?        @map("last_ip_address")
+  isEnrolled      Boolean        @default(true) @map("is_enrolled")
+  revokedAt       DateTime?      @map("revoked_at")
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+
+  organization    Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  deviceKeys      DeviceKey[]
+  devicePolicy    DevicePolicy?
+  remoteSessions  RemoteSession[]
+
+  @@index([organizationId])
+  @@index([status])
+  @@map("devices")
+}
+
+enum DeviceStatus {
+  ONLINE
+  DEGRADED
+  OFFLINE
+  REVOKED
+}
+
+model DeviceKey {
+  id          String   @id @default(uuid())
+  deviceId    String   @map("device_id")
+  publicKey   String   @map("public_key") // Base64 encoded Ed25519 public key
+  algorithm   String   @default("Ed25519")
+  keyFingerprint String @unique @map("key_fingerprint")
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  device      Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId])
+  @@map("device_keys")
+}
+
+model DeviceEnrollmentToken {
+  id              String       @id @default(uuid())
+  organizationId  String       @map("organization_id")
+  tokenHash       String       @unique @map("token_hash")
+  createdById     String       @map("created_by_id")
+  expiresAt       DateTime     @map("expires_at")
+  isUsed          Boolean      @default(false) @map("is_used")
+  usedAt          DateTime?    @map("used_at")
+  createdAt       DateTime     @default(now()) @map("created_at")
+
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@map("device_enrollment_tokens")
+}
+
+model DevicePolicy {
+  id                    String   @id @default(uuid())
+  deviceId              String   @unique @map("device_id")
+  allowUnattendedAccess Boolean  @default(false) @map("allow_unattended_access")
+  requireMfa            Boolean  @default(true) @map("require_mfa")
+  allowClipboard        Boolean  @default(true) @map("allow_clipboard")
+  allowFileTransfer     Boolean  @default(true) @map("allow_file_transfer")
+  requireSessionRecording Boolean @default(false) @map("require_session_recording")
+  userNotificationMode  String   @default("POPUP") @map("user_notification_mode")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  device                Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@map("device_policies")
+}
+
+// -----------------------------------------------------------------------------
+// Remote Desktop Sessions & Events
+// -----------------------------------------------------------------------------
+
+model RemoteSession {
+  id              String               @id @default(uuid())
+  deviceId        String               @map("device_id")
+  viewerUserId    String               @map("viewer_user_id")
+  sessionToken    String               @unique @map("session_token")
+  state           SessionState         @default(DISCONNECTED)
+  ipAddressViewer String?              @map("ip_address_viewer")
+  ipAddressHost   String?              @map("ip_address_host")
+  transportType   TransportType        @default(DIRECT_P2P) @map("transport_type")
+  startedAt       DateTime?            @map("started_at")
+  endedAt         DateTime?            @map("ended_at")
+  endReason       String?              @map("end_reason")
+  createdAt       DateTime             @default(now()) @map("created_at")
+  updatedAt       DateTime             @updatedAt @map("updated_at")
+
+  device          Device               @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  viewerUser      User                 @relation("ViewerSessions", fields: [viewerUserId], references: [id], onDelete: Cascade)
+  capabilities    RemoteSessionCapability?
+  events          RemoteSessionEvent[]
+  fileTransfers   FileTransferMetadata[]
+
+  @@index([deviceId])
+  @@index([viewerUserId])
+  @@index([state])
+  @@map("remote_sessions")
+}
+
+enum SessionState {
+  DISCONNECTED
+  AUTHORIZING
+  SIGNALING
+  ICE_GATHERING
+  CONNECTING
+  CONNECTED
+  DEGRADED
+  RECONNECTING
+  REJECTED
+  EXPIRED
+  FAILED
+  ENDED
+}
+
+enum TransportType {
+  DIRECT_P2P
+  TURN_RELAY
+}
+
+model RemoteSessionCapability {
+  id              String        @id @default(uuid())
+  sessionId       String        @unique @map("session_id")
+  screenView      Boolean       @default(true) @map("screen_view")
+  control         Boolean       @default(false)
+  clipboard       Boolean       @default(false)
+  fileTransfer    Boolean       @default(false) @map("file_transfer")
+  audioListen     Boolean       @default(false) @map("audio_listen")
+  negotiatedAt    DateTime      @default(now()) @map("negotiated_at")
+
+  session         RemoteSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@map("remote_session_capabilities")
+}
+
+model RemoteSessionEvent {
+  id          String        @id @default(uuid())
+  sessionId   String        @map("session_id")
+  eventType   String        @map("event_type")
+  metadata    Json?
+  timestamp   DateTime      @default(now())
+
+  session     RemoteSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@map("remote_session_events")
+}
+
+// -----------------------------------------------------------------------------
+// Security Audit Logs
+// -----------------------------------------------------------------------------
+
+model AuditLog {
+  id              String        @id @default(uuid())
+  organizationId  String        @map("organization_id")
+  actorId         String?       @map("actor_id")
+  actorType       String        @map("actor_type") // USER, DEVICE, SYSTEM
+  action          String
+  targetType      String        @map("target_type")
+  targetId        String?       @map("target_id")
+  sessionId       String?       @map("session_id")
+  sourceIp        String?       @map("source_ip")
+  userAgent       String?       @map("user_agent")
+  result          AuditResult   @default(SUCCESS)
+  reason          String?
+  metadata        Json?
+  timestamp       DateTime      @default(now())
+
+  organization    Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([actorId])
+  @@index([action])
+  @@index([timestamp])
+  @@map("audit_logs")
+}
+
+enum AuditResult {
+  SUCCESS
+  FAILURE
+  DENIED
+}
+
+// -----------------------------------------------------------------------------
+// File Transfer & Software Releases
+// -----------------------------------------------------------------------------
+
+model FileTransferMetadata {
+  id            String              @id @default(uuid())
+  sessionId     String              @map("session_id")
+  transferId    String              @unique @map("transfer_id")
+  direction     String              // UPLOAD, DOWNLOAD
+  fileName      String              @map("file_name")
+  fileSizeBytes BigInt              @map("file_size_bytes")
+  chunkSize     Int                 @map("chunk_size")
+  totalChunks   Int                 @map("total_chunks")
+  sha256Checksum String             @map("sha256_checksum")
+  status        FileTransferStatus  @default(QUEUED)
+  errorMessage  String?             @map("error_message")
+  startedAt     DateTime            @default(now()) @map("started_at")
+  completedAt   DateTime?           @map("completed_at")
+
+  session       RemoteSession       @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@map("file_transfer_metadata")
+}
+
+enum FileTransferStatus {
+  QUEUED
+  NEGOTIATING
+  TRANSFERRING
+  PAUSED
+  VERIFYING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model SoftwareRelease {
+  id            String   @id @default(uuid())
+  version       String   @unique
+  minVersion    String   @map("min_version")
+  channel       String   @default("stable") // stable, beta
+  os            String
+  architecture  String
+  downloadUrl   String   @map("download_url")
+  sha256        String
+  signature     String
+  releaseNotes  String?  @map("release_notes")
+  publishedAt   DateTime @default(now()) @map("published_at")
+
+  @@map("software_releases")
+}

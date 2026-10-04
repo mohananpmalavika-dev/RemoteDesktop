@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: krypton-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: krypton
+      POSTGRES_PASSWORD: krypton_secret_dev
+      POSTGRES_DB: krypton_remote
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U krypton -d krypton_remote"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - krypton-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: krypton-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - krypton-net
+
+  coturn:
+    image: coturn/coturn:latest
+    container_name: krypton-coturn
+    restart: unless-stopped
+    volumes:
+      - ./coturn/turnserver.conf:/etc/turnserver.conf:ro
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "5349:5349/udp"
+      - "5349:5349/tcp"
+      - "49152-49200:49152-49200/udp"
+    command: ["-c", "/etc/turnserver.conf"]
+    networks:
+      - krypton-net
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  krypton-net:
+    driver: bridge

@@ -1,0 +1,29 @@
+{
+  "name": "@krypton/signaling",
+  "version": "1.0.0",
+  "private": true,
+  "main": "./dist/main.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@krypton/config": "*",
+    "@krypton/logger": "*",
+    "@krypton/protocol": "*",
+    "@krypton/shared-types": "*",
+    "ioredis": "^5.5.0",
+    "jsonwebtoken": "^9.0.2",
+    "uuid": "^11.0.5",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.8",
+    "@types/node": "^22.13.0",
+    "@types/uuid": "^10.0.0",
+    "@types/ws": "^8.5.14",
+    "typescript": "^5.7.3"
+  }
+}

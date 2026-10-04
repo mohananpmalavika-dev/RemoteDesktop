@@ -1,0 +1,25 @@
+[package]
+name = "krypton-desktop"
+version = "0.1.0"
+description = "KryptonRemote Desktop Host and Viewer Client"
+authors = ["KryptonLogic"]
+edition = "2021"
+
+[[bin]]
+name = "krypton-desktop"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+krypton-remote-core = { path = "../../../crates/remote-core" }
+krypton-transport = { path = "../../../crates/transport" }
+krypton-platform-windows = { path = "../../../crates/platform-windows" }
+tauri = { version = "2.2", features = [] }
+tauri-plugin-shell = "2.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+env_logger = "0.11"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }

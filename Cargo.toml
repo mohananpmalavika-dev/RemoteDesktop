@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/remote-core",
+    "crates/capture",
+    "crates/encoder",
+    "crates/input",
+    "crates/clipboard",
+    "crates/file-transfer",
+    "crates/transport",
+    "crates/device-identity",
+    "crates/platform-windows",
+    "apps/desktop/src-tauri"
+]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

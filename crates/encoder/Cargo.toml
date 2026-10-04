@@ -1,0 +1,12 @@
+[package]
+name = "krypton-encoder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+krypton-capture = { path = "../capture" }
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+# Pure-Rust H.264 encoder — no C deps, works on GNU and MSVC
+rusty_h264 = "0.16"
