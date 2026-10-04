@@ -438,24 +438,33 @@ export function DesktopHub(p: Props) {
                     <p className="inline-error" role="alert">{p.identityError}</p>
                   )}
                   {p.isNative && !validIdentity && p.remoteId !== "Loading..." && (
-                    <form className="enrollment-form" onSubmit={async (event) => {
-                      event.preventDefault();
-                      await p.onEnroll(apiUrl, enrollmentToken);
-                      setEnrollmentToken("");
-                    }}>
-                      <p>Register with your administrator's server to get your 9-digit Remote ID.</p>
-                      <label htmlFor="api-url">API server URL</label>
-                      <input id="api-url" type="url" value={apiUrl} required
-                        placeholder="https://your-server/api/v1" disabled={p.enrolling}
-                        onChange={(event) => setApiUrl(event.target.value)} />
-                      <label htmlFor="enrollment-token">Device enrollment token</label>
-                      <input id="enrollment-token" type="password" value={enrollmentToken} required
-                        autoComplete="off" disabled={p.enrolling}
-                        onChange={(event) => setEnrollmentToken(event.target.value)} />
-                      <button className="btn-primary" type="submit" disabled={p.enrolling}>
-                        {p.enrolling ? "Registering device..." : "Get Remote ID"}
+                    <div className="enrollment-form">
+                      <p>Connect to the Krypton Cloud network to get your 9-digit Remote ID.</p>
+                      <button
+                        className="btn-primary"
+                        type="button"
+                        disabled={p.enrolling}
+                        onClick={async () => {
+                          await p.onEnroll(apiUrl, enrollmentToken);
+                          setEnrollmentToken("");
+                        }}
+                      >
+                        {p.enrolling ? "Connecting to network..." : "Get Remote ID"}
                       </button>
-                    </form>
+                      <details style={{ marginTop: "10px", fontSize: "0.8rem", color: "var(--text-muted, #94a3b8)", opacity: 0.85 }}>
+                        <summary style={{ cursor: "pointer", userSelect: "none" }}>Advanced / Private Server (optional)</summary>
+                        <div style={{ marginTop: "8px", display: "flex", flexDirection: "column", gap: "6px" }}>
+                          <label htmlFor="api-url" style={{ fontSize: "0.75rem" }}>Server URL</label>
+                          <input id="api-url" type="url" value={apiUrl}
+                            placeholder="http://35.244.54.249:4000/api/v1" disabled={p.enrolling}
+                            onChange={(event) => setApiUrl(event.target.value)} />
+                          <label htmlFor="enrollment-token" style={{ fontSize: "0.75rem" }}>Enrollment Token</label>
+                          <input id="enrollment-token" type="password" value={enrollmentToken}
+                            autoComplete="off" disabled={p.enrolling}
+                            onChange={(event) => setEnrollmentToken(event.target.value)} />
+                        </div>
+                      </details>
+                    </div>
                   )}
                   <div className="device-bottom">
                     <div className="device-host">

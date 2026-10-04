@@ -33,6 +33,10 @@ interface ActiveViewerSession {
   packetLossPct: number;
 }
 
+const DEFAULT_API_URL = import.meta.env.VITE_API_BASE_URL
+  ? `${import.meta.env.VITE_API_BASE_URL}/api/v1`
+  : "http://35.244.54.249:4000/api/v1";
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<
     | "home"
@@ -89,17 +93,30 @@ export default function App() {
     (async () => {
       try {
         const { invoke } = await import("@tauri-apps/api/core");
+
         try {
           const id = await invoke<string | null>("initialize_identity");
           const formatted = formatRemoteId(id);
-          setMyRemoteId(formatted ?? "Registration required");
-          if (id !== null && !formatted) {
-            setIdentityError("No valid Remote ID was returned. Register this device with your API server.");
+          if (formatted) {
+            setMyRemoteId(formatted);
+          } else {
+            // Auto-enroll automatically with internal cloud endpoint
+            setMyRemoteId("Connecting...");
+            try {
+              const newId = await invoke<string>("enroll_device", {
+                apiUrl: DEFAULT_API_URL,
+                enrollmentToken: null,
+              });
+              const newFormatted = formatRemoteId(newId);
+              setMyRemoteId(newFormatted ?? "Registration required");
+            } catch (autoErr) {
+              console.warn("Auto-enroll fallback:", autoErr);
+              setMyRemoteId("Registration required");
+            }
           }
         } catch (idErr) {
           console.warn("Device identity initialize fallback:", idErr);
-          setMyRemoteId("Unavailable");
-          setIdentityError(typeof idErr === "string" ? idErr : "Could not load this device's registration.");
+          setMyRemoteId("Registration required");
         }
 
         const telemetry = await invoke<any>("get_windows_telemetry");
@@ -116,13 +133,17 @@ export default function App() {
     })();
   }, []);
 
-  const handleEnroll = async (apiUrl: string, enrollmentToken: string) => {
+  const handleEnroll = async (apiUrl = "", enrollmentToken = "") => {
     if (!isNative || enrolling) return;
     setEnrolling(true);
     setIdentityError("");
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      const id = await invoke<string>("enroll_device", { apiUrl, enrollmentToken });
+      const targetUrl = apiUrl.trim() || DEFAULT_API_URL;
+      const id = await invoke<string>("enroll_device", {
+        apiUrl: targetUrl,
+        enrollmentToken: enrollmentToken.trim() ? enrollmentToken.trim() : null,
+      });
       const formatted = formatRemoteId(id);
       if (!formatted) throw new Error("The server did not return a valid 9-digit Remote ID.");
       setMyRemoteId(formatted);

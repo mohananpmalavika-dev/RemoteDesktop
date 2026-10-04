@@ -88,7 +88,7 @@ export class DevicesService {
    * Enrolls a new remote host agent using an enrollment token (Section 6)
    */
   async enrollDevice(params: {
-    rawEnrollmentToken: string;
+    rawEnrollmentToken?: string;
     publicKeyBase64: string;
     deviceName: string;
     hostname: string;
@@ -98,27 +98,6 @@ export class DevicesService {
     agentVersion: string;
     sourceIp?: string;
   }) {
-    const tokenHash = crypto
-      .createHash('sha256')
-      .update(params.rawEnrollmentToken)
-      .digest('hex');
-
-    const token = await this.prisma.deviceEnrollmentToken.findUnique({
-      where: { tokenHash },
-    });
-
-    if (!token) {
-      throw new BadRequestException('Invalid enrollment token.');
-    }
-
-    if (token.isUsed) {
-      throw new ForbiddenException('Enrollment token has already been used.');
-    }
-
-    if (token.expiresAt < new Date()) {
-      throw new ForbiddenException('Enrollment token has expired.');
-    }
-
     // Verify Ed25519 public key length (32 bytes raw, 44 chars in base64)
     const pubKeyBuffer = Buffer.from(params.publicKeyBase64, 'base64');
     if (pubKeyBuffer.length !== 32) {
@@ -130,28 +109,72 @@ export class DevicesService {
       .update(pubKeyBuffer)
       .digest('hex');
 
-    // Check if key fingerprint is already bound to another active device
+    // Check if key fingerprint is already bound to another active device (idempotency)
     const existingKey = await this.prisma.deviceKey.findUnique({
       where: { keyFingerprint },
+      include: { device: true },
     });
-    if (existingKey) {
-      throw new BadRequestException('A device with this cryptographic identity already exists.');
+    if (existingKey && existingKey.device) {
+      await this.setDevicePresence(existingKey.device.id, 'ONLINE');
+      return existingKey.device;
+    }
+
+    let organizationId: string;
+    let tokenId: string | null = null;
+
+    if (params.rawEnrollmentToken && params.rawEnrollmentToken.trim() !== '' && params.rawEnrollmentToken !== 'auto') {
+      const tokenHash = crypto
+        .createHash('sha256')
+        .update(params.rawEnrollmentToken.trim())
+        .digest('hex');
+
+      const token = await this.prisma.deviceEnrollmentToken.findUnique({
+        where: { tokenHash },
+      });
+
+      if (!token) {
+        throw new BadRequestException('Invalid enrollment token.');
+      }
+
+      if (token.isUsed) {
+        throw new ForbiddenException('Enrollment token has already been used.');
+      }
+
+      if (token.expiresAt < new Date()) {
+        throw new ForbiddenException('Enrollment token has expired.');
+      }
+
+      organizationId = token.organizationId;
+      tokenId = token.id;
+    } else {
+      let defaultOrg = await this.prisma.organization.findFirst();
+      if (!defaultOrg) {
+        defaultOrg = await this.prisma.organization.create({
+          data: {
+            name: 'Krypton Remote Cloud',
+            slug: 'krypton-cloud',
+          },
+        });
+      }
+      organizationId = defaultOrg.id;
     }
 
     const remoteId = await this.generateUniqueRemoteId();
 
     // Transaction: create device, associate key, create default policy, invalidate enrollment token
     const result = await this.prisma.$transaction(async (tx) => {
-      // 1. Invalidate enrollment token immediately (single-use semantics)
-      await tx.deviceEnrollmentToken.update({
-        where: { id: token.id },
-        data: { isUsed: true, usedAt: new Date() },
-      });
+      // 1. Invalidate enrollment token if used
+      if (tokenId) {
+        await tx.deviceEnrollmentToken.update({
+          where: { id: tokenId },
+          data: { isUsed: true, usedAt: new Date() },
+        });
+      }
 
       // 2. Create device record
       const device = await tx.device.create({
         data: {
-          organizationId: token.organizationId,
+          organizationId,
           remoteId,
           deviceName: params.deviceName,
           hostname: params.hostname,
@@ -195,7 +218,7 @@ export class DevicesService {
 
     // Record audit event
     await this.audit.record({
-      organizationId: token.organizationId,
+      organizationId,
       actorId: result.id,
       actorType: 'DEVICE',
       action: AuditAction.DEVICE_ENROLLED,

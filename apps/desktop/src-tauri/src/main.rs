@@ -119,21 +119,27 @@ fn initialize_identity(app: AppHandle, state: State<AppState>) -> Result<Option<
     engine.shareable_remote_id()
 }
 
+const DEFAULT_API_URL: &str = "http://35.244.54.249:4000/api/v1";
+
 #[tauri::command]
 async fn enroll_device(
     app: AppHandle,
     state: State<'_, AppState>,
-    api_url: String,
-    enrollment_token: String,
+    api_url: Option<String>,
+    enrollment_token: Option<String>,
 ) -> Result<String, String> {
-    if enrollment_token.trim().is_empty() {
-        return Err("Enter the device enrollment token from your administrator.".into());
-    }
-    let mut url = reqwest::Url::parse(api_url.trim())
-        .map_err(|_| "Enter a valid API URL, including https://.".to_string())?;
-    let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-    if url.scheme() != "https" && !(url.scheme() == "http" && local) {
-        return Err("Use HTTPS for your API server, or HTTP for localhost development.".into());
+    let raw_url = api_url.as_deref().unwrap_or("").trim();
+    let effective_url = if raw_url.is_empty() {
+        DEFAULT_API_URL
+    } else {
+        raw_url
+    };
+
+    let mut url = reqwest::Url::parse(effective_url)
+        .map_err(|_| "Enter a valid API URL (e.g. http://server:4000/api/v1).".to_string())?;
+
+    if url.scheme() != "https" && url.scheme() != "http" {
+        return Err("API URL must use http or https.".into());
     }
     if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
         return Err("API URL must not contain credentials, a query, or a fragment.".into());
@@ -141,27 +147,30 @@ async fn enroll_device(
     let base_path = url.path().trim_end_matches('/');
     let enrollment_path = if base_path.is_empty() {
         "/api/v1/devices/enroll".to_string()
+    } else if base_path.ends_with("/devices/enroll") {
+        base_path.to_string()
     } else {
         format!("{base_path}/devices/enroll")
     };
     url.set_path(&enrollment_path);
+    let token = enrollment_token.as_deref().unwrap_or("").trim();
     let request = {
         let mut engine = state.engine.lock().map_err(|e| e.to_string())?;
         if let Some(id) = engine.shareable_remote_id()? { return Ok(id); }
         prepare_identity(&app, &mut engine)?;
         let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows device".into());
-        engine.create_enrollment_request(enrollment_token.trim(), &name)?
+        engine.create_enrollment_request(token, &name)?
     };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build().map_err(|_| "Could not initialize the registration client.".to_string())?;
     let response = client.post(url).json(&request).send().await
-        .map_err(|_| "Could not reach the API server. Check its URL and network connection.".to_string())?;
+        .map_err(|_| "Could not reach the Krypton cloud server. Check network connection.".to_string())?;
     if !response.status().is_success() {
         return Err(match response.status().as_u16() {
             400 | 403 => "Registration rejected. Check that the enrollment token is valid, unused, and unexpired.".into(),
-            404 => "Enrollment endpoint not found. Check the API URL (for example https://server/api/v1).".into(),
+            404 => "Enrollment endpoint not found. Check the API URL.".into(),
             status => format!("Device registration failed (HTTP {status})."),
         });
     }
@@ -174,7 +183,7 @@ async fn enroll_device(
     let remote_id = krypton_remote_core::format_remote_id(&result.remote_id)?;
     let saved = EnrolledIdentity {
         device_id: result.device_id.clone(), remote_id: remote_id.clone(),
-        public_key_base64: request.public_key_base64, api_url: api_url.trim().to_string(),
+        public_key_base64: request.public_key_base64, api_url: effective_url.to_string(),
     };
     let directory = identity_directory(&app)?;
     let bytes = serde_json::to_vec(&saved).map_err(|e| e.to_string())?;

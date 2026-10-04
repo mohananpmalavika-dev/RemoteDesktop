@@ -32,7 +32,8 @@ pub enum EngineState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceEnrollmentRequest {
-    pub enrollment_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enrollment_token: Option<String>,
     pub public_key_base64: String,
     pub device_name: String,
     pub hostname: String,
@@ -116,9 +117,14 @@ impl RemoteEngine {
         };
 
         let sys_info = get_windows_system_info();
+        let token = if enrollment_token.trim().is_empty() || enrollment_token == "auto" {
+            None
+        } else {
+            Some(enrollment_token.trim().to_string())
+        };
 
         Ok(DeviceEnrollmentRequest {
-            enrollment_token: enrollment_token.to_string(),
+            enrollment_token: token,
             public_key_base64: pubkey,
             device_name: device_name.to_string(),
             hostname: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "DESKTOP-NODE".to_string()),
@@ -841,7 +847,7 @@ mod tests {
 
         let req = engine.create_enrollment_request("ket_test_token_123", "Finance-Host").unwrap();
         assert_eq!(req.device_name, "Finance-Host");
-        assert_eq!(req.enrollment_token, "ket_test_token_123");
+        assert_eq!(req.enrollment_token, Some("ket_test_token_123".to_string()));
         assert!(!req.public_key_base64.is_empty());
         assert_eq!(engine.state(), EngineState::Enrolled);
 

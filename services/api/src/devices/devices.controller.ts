@@ -49,9 +49,9 @@ export class DevicesController {
       agentVersion,
     } = body;
 
-    if (!enrollmentToken || !publicKeyBase64 || !deviceName || !hostname) {
+    if (!publicKeyBase64 || !deviceName || !hostname) {
       throw new BadRequestException(
-        'enrollmentToken, publicKeyBase64, deviceName, and hostname are required.'
+        'publicKeyBase64, deviceName, and hostname are required.'
       );
     }
 
