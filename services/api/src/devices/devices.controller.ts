@@ -16,6 +16,10 @@ import { Public } from '../auth/public.decorator';
 import { RequirePermissions } from '../rbac/permissions.decorator';
 import { PermissionsGuard } from '../rbac/permissions.guard';
 import { KryptonPermission, DeviceHeartbeat } from '@krypton/shared-types';
+import { DeviceAuthGuard } from '../auth/device-auth.guard';
+import { parseBody } from '../common/validation';
+import { z } from 'zod';
+import { getConfig } from '@krypton/config';
 
 @Controller('devices')
 @UseGuards(PermissionsGuard)
@@ -31,7 +35,7 @@ export class DevicesController {
     return this.devicesService.createEnrollmentToken(
       user.organizationId,
       user.id,
-      expiresInHours || 24
+      expiresInHours ?? 24
     );
   }
 
@@ -72,11 +76,18 @@ export class DevicesController {
 
   @Public()
   @Post(':id/heartbeat')
+  @UseGuards(DeviceAuthGuard)
   async heartbeat(
     @Param('id') deviceId: string,
     @Body() body: Partial<DeviceHeartbeat>,
     @Req() req: any
   ) {
+    body = parseBody(z.object({
+      agentVersion: z.string().min(1).max(32), os: z.string().min(1).max(64),
+      osVersion: z.string().min(1).max(64), architecture: z.string().min(1).max(32),
+      sessionCount: z.number().int().min(0).max(100), cpuPercent: z.number().min(0).max(100),
+      memoryPercent: z.number().min(0).max(100), uptimeSeconds: z.number().int().nonnegative(),
+    }).strict(), body);
     const ip = req.ip || req.socket.remoteAddress;
 
     const heartbeatPayload: DeviceHeartbeat = {
@@ -93,6 +104,13 @@ export class DevicesController {
     };
 
     return this.devicesService.processHeartbeat(heartbeatPayload, ip);
+  }
+
+  @Public()
+  @Post(':id/runtime-config')
+  @UseGuards(DeviceAuthGuard)
+  async getRuntimeConfig(@Req() req: any) {
+    return { deviceId: req.device.id, signalingUrl: getConfig().SIGNALING_PUBLIC_URL };
   }
 
   @Get()
@@ -116,7 +134,7 @@ export class DevicesController {
   }
 
   @Patch(':id')
-  @RequirePermissions(KryptonPermission.DEVICE_RENAME)
+  @RequirePermissions(KryptonPermission.DEVICE_RENAME, KryptonPermission.POLICY_MANAGE)
   async updateDevice(
     @CurrentUser() user: any,
     @Param('id') deviceId: string,

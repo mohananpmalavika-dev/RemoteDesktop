@@ -3,6 +3,25 @@ import crypto from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { createLogger } from '@krypton/logger';
 import { AuditAction } from '@krypton/shared-types';
+import { parseBody, paginationSchema } from '../common/validation';
+
+const SENSITIVE_KEYS = /password|token|secret|private.?key|clipboard(content|payload)|authorization|cookie|signature|^jwt$|^_chain$/i;
+export function sanitizeAuditMetadata(value: any): any {
+  if (Array.isArray(value)) return value.map(sanitizeAuditMetadata);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !SENSITIVE_KEYS.test(key)).map(([key, item]) => [key, sanitizeAuditMetadata(item)]));
+  return value;
+}
+
+function canonicalEvent(entry: any, metadata: any, version: number): string {
+  return JSON.stringify({
+    organizationId: entry.organizationId, actorId: entry.actorId || 'SYSTEM', actorType: entry.actorType,
+    action: entry.action, targetType: entry.targetType, targetId: entry.targetId || 'NONE',
+    result: entry.result || 'SUCCESS', timestamp: new Date(entry.timestamp).toISOString(), sanitizedMetadata: metadata,
+    ...(version === 2 ? { sessionId: entry.sessionId ?? null, sourceIp: entry.sourceIp ?? null,
+      userAgent: entry.userAgent ?? null, reason: entry.reason ?? null } : {}),
+  });
+}
 
 const logger = createLogger({ serviceName: 'audit-service' });
 
@@ -40,7 +59,7 @@ export class AuditService {
   async record(params: RecordAuditParams) {
     try {
       // Ensure zero sensitive credentials in audit metadata (Section 18 & 28)
-      const sanitizedMetadata = params.metadata ? { ...params.metadata } : {};
+      const sanitizedMetadata = sanitizeAuditMetadata(params.metadata || {});
       delete sanitizedMetadata.password;
       delete sanitizedMetadata.passwordHash;
       delete sanitizedMetadata.token;
@@ -51,27 +70,19 @@ export class AuditService {
       delete sanitizedMetadata.turnSecret;
 
       // 1. Fetch the latest audit record to get the previous event hash
-      const lastRecord = await this.prisma.auditLog.findFirst({
+      return await this.prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${params.organizationId}))::text`;
+      const lastRecord = await tx.auditLog.findFirst({
         where: { organizationId: params.organizationId },
         orderBy: { timestamp: 'desc' },
       });
 
       const lastMetadata = (lastRecord?.metadata as any) || {};
       const previousHash = lastMetadata._chain?.eventHash || 'GENESIS_HASH_KRYPTON_AUDIT_V1';
-      const eventTimestamp = new Date();
+      const eventTimestamp = new Date(Math.max(Date.now(), (lastRecord?.timestamp.getTime() ?? 0) + 1));
 
       // 2. Build canonical payload
-      const canonicalPayload = JSON.stringify({
-        organizationId: params.organizationId,
-        actorId: params.actorId || 'SYSTEM',
-        actorType: params.actorType,
-        action: params.action,
-        targetType: params.targetType,
-        targetId: params.targetId || 'NONE',
-        result: params.result || 'SUCCESS',
-        timestamp: eventTimestamp.toISOString(),
-        sanitizedMetadata,
-      });
+      const canonicalPayload = canonicalEvent({ ...params, timestamp: eventTimestamp }, sanitizedMetadata, 2);
 
       // 3. Compute Merkle event hash: SHA256(canonicalPayload + previousHash)
       const eventHash = crypto
@@ -80,12 +91,13 @@ export class AuditService {
         .digest('hex');
 
       sanitizedMetadata._chain = {
+        version: 2,
         previousHash,
         eventHash,
         canonicalPayload,
       };
 
-      const record = await this.prisma.auditLog.create({
+      const record = await tx.auditLog.create({
         data: {
           organizationId: params.organizationId,
           actorId: params.actorId,
@@ -115,8 +127,9 @@ export class AuditService {
       );
 
       return record;
+      });
     } catch (err) {
-      logger.error({ err, params }, 'CRITICAL: Failed to write security audit log');
+      logger.error({ err, organizationId: params.organizationId, action: params.action }, 'CRITICAL: Failed to write security audit log');
       throw err;
     }
   }
@@ -178,6 +191,12 @@ export class AuditService {
         };
       }
 
+      const { _chain, ...storedMetadata } = meta;
+      if (canonicalEvent(entry, storedMetadata, chain.version ?? 1) !== chain.canonicalPayload) {
+        return { valid: false, verifiedCount: i, lastEventHash: chain.eventHash, errorIndex: i,
+          errorMessage: `Stored audit fields were modified at index ${i}.` };
+      }
+
       expectedPreviousHash = chain.eventHash;
     }
 
@@ -189,6 +208,7 @@ export class AuditService {
   }
 
   async getOrganizationAuditLogs(organizationId: string, limit = 50, offset = 0) {
+    ({ limit, offset } = parseBody(paginationSchema, { limit, offset }));
     return this.prisma.auditLog.findMany({
       where: { organizationId },
       orderBy: { timestamp: 'desc' },

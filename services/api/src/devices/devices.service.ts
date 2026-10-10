@@ -14,6 +14,8 @@ import {
   AuditAction,
 } from '@krypton/shared-types';
 import { createLogger } from '@krypton/logger';
+import { parseBody, devicePolicySchema, paginationSchema } from '../common/validation';
+import { z } from 'zod';
 
 const logger = createLogger({ serviceName: 'devices-service' });
 
@@ -32,7 +34,7 @@ export class DevicesService {
   private async generateUniqueRemoteId(): Promise<string> {
     for (let attempts = 0; attempts < 10; attempts++) {
       // Generate 9 random digits avoiding leading zeroes for clarity
-      const rawNumber = Math.floor(100000000 + Math.random() * 900000000).toString();
+      const rawNumber = crypto.randomInt(100000000, 1000000000).toString();
       const formatted = `${rawNumber.slice(0, 3)} ${rawNumber.slice(3, 6)} ${rawNumber.slice(6, 9)}`;
 
       const exists = await this.prisma.device.findUnique({
@@ -54,6 +56,7 @@ export class DevicesService {
     createdById: string,
     expiresInHours = 24
   ) {
+    parseBody(z.number().int().min(1).max(168), expiresInHours);
     const rawToken = 'ket_' + crypto.randomBytes(32).toString('hex');
     const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
     const expiresAt = new Date(Date.now() + expiresInHours * 60 * 60 * 1000);
@@ -79,7 +82,7 @@ export class DevicesService {
     });
 
     return {
-      enrollmentToken: rawToken,
+      token: rawToken,
       expiresAt: tokenRecord.expiresAt,
     };
   }
@@ -98,6 +101,13 @@ export class DevicesService {
     agentVersion: string;
     sourceIp?: string;
   }) {
+    params = parseBody(z.object({
+      rawEnrollmentToken: z.string().min(20).max(200),
+      publicKeyBase64: z.string().regex(/^[A-Za-z0-9+/]{43}=$/),
+      deviceName: z.string().trim().min(1).max(128), hostname: z.string().trim().min(1).max(255),
+      os: z.string().min(1).max(64), osVersion: z.string().min(1).max(64),
+      architecture: z.string().min(1).max(32), agentVersion: z.string().min(1).max(32), sourceIp: z.string().optional(),
+    }).strict(), params);
     // Verify Ed25519 public key length (32 bytes raw, 44 chars in base64)
     const pubKeyBuffer = Buffer.from(params.publicKeyBase64, 'base64');
     if (pubKeyBuffer.length !== 32) {
@@ -114,10 +124,6 @@ export class DevicesService {
       where: { keyFingerprint },
       include: { device: true },
     });
-    if (existingKey && existingKey.device) {
-      await this.setDevicePresence(existingKey.device.id, 'ONLINE');
-      return existingKey.device;
-    }
 
     let organizationId: string;
     let tokenId: string | null = null;
@@ -147,16 +153,10 @@ export class DevicesService {
       organizationId = token.organizationId;
       tokenId = token.id;
     } else {
-      let defaultOrg = await this.prisma.organization.findFirst();
-      if (!defaultOrg) {
-        defaultOrg = await this.prisma.organization.create({
-          data: {
-            name: 'Krypton Remote Cloud',
-            slug: 'krypton-cloud',
-          },
-        });
-      }
-      organizationId = defaultOrg.id;
+      throw new ForbiddenException('A single-use enrollment token is required.');
+    }
+    if (existingKey && (existingKey.device.organizationId !== organizationId || !existingKey.isActive || existingKey.device.status === 'REVOKED')) {
+      throw new ForbiddenException('This device identity is revoked or belongs to another organization.');
     }
 
     const remoteId = await this.generateUniqueRemoteId();
@@ -165,11 +165,13 @@ export class DevicesService {
     const result = await this.prisma.$transaction(async (tx) => {
       // 1. Invalidate enrollment token if used
       if (tokenId) {
-        await tx.deviceEnrollmentToken.update({
-          where: { id: tokenId },
+        const claimed = await tx.deviceEnrollmentToken.updateMany({
+          where: { id: tokenId, isUsed: false, expiresAt: { gt: new Date() } },
           data: { isUsed: true, usedAt: new Date() },
         });
+        if (claimed.count !== 1) throw new ForbiddenException('Enrollment token has already been used or expired.');
       }
+      if (existingKey) return existingKey.device;
 
       // 2. Create device record
       const device = await tx.device.create({
@@ -182,8 +184,7 @@ export class DevicesService {
           osVersion: params.osVersion,
           architecture: params.architecture,
           agentVersion: params.agentVersion,
-          status: 'ONLINE',
-          lastSeenAt: new Date(),
+          status: 'OFFLINE',
           lastIpAddress: params.sourceIp,
         },
       });
@@ -214,7 +215,7 @@ export class DevicesService {
     });
 
     // Mark as online in Redis presence
-    await this.setDevicePresence(result.id, 'ONLINE');
+    await this.redis.getClient().set(`krypton:device:key:${result.id}`, JSON.stringify({ publicKey: params.publicKeyBase64, organizationId }));
 
     // Record audit event
     await this.audit.record({
@@ -306,9 +307,6 @@ export class DevicesService {
     const client = this.redis.getClient();
     const presence = await client.get(`krypton:presence:${deviceId}`);
 
-    if (presence === 'ONLINE') {
-      return DeviceStatus.ONLINE;
-    }
 
     // Check durable database record for degraded vs offline
     const device = await this.prisma.device.findUnique({
@@ -318,17 +316,15 @@ export class DevicesService {
 
     if (!device) return DeviceStatus.OFFLINE;
     if (device.status === 'REVOKED') return DeviceStatus.REVOKED;
+    if (presence === 'ONLINE') return DeviceStatus.ONLINE;
 
     if (device.lastSeenAt) {
       const msSinceLastSeen = Date.now() - device.lastSeenAt.getTime();
-      if (msSinceLastSeen < 15 * 60 * 1000) {
-        return DeviceStatus.ONLINE;
+      if (msSinceLastSeen < 90 * 1000) {
+        return DeviceStatus.DEGRADED;
       }
     }
 
-    if (device.status === DeviceStatus.ONLINE) {
-      return DeviceStatus.ONLINE;
-    }
 
     return DeviceStatus.OFFLINE;
   }
@@ -337,6 +333,7 @@ export class DevicesService {
    * List devices with presence resolution
    */
   async listDevices(organizationId: string, limit = 50, offset = 0) {
+    ({ limit, offset } = parseBody(paginationSchema, { limit, offset }));
     const devices = await this.prisma.device.findMany({
       where: { organizationId },
       include: {
@@ -366,9 +363,10 @@ export class DevicesService {
 
         return {
           ...d,
+          status: liveStatus,
           liveStatus,
-          cpuPercent: telem?.cpuPercent ?? (liveStatus === 'ONLINE' ? 12 : 0),
-          memoryPercent: telem?.memoryPercent ?? (liveStatus === 'ONLINE' ? 38 : 0),
+          cpuPercent: telem?.cpuPercent ?? null,
+          memoryPercent: telem?.memoryPercent ?? null,
           uptimeSeconds: telem?.uptimeSeconds ?? 0,
           sessionCount: telem?.sessionCount ?? 0,
           lastHeartbeat: telem?.lastHeartbeat ?? (d.lastSeenAt ? d.lastSeenAt.toISOString() : 'Never'),
@@ -406,6 +404,7 @@ export class DevicesService {
     updates: { alias?: string; policy?: any },
     actorId: string
   ) {
+    updates = parseBody(z.object({ alias: z.string().trim().min(1).max(128).optional(), policy: devicePolicySchema.optional() }).strict(), updates);
     const device = await this.prisma.device.findFirst({
       where: { id: deviceId, organizationId },
     });
@@ -463,17 +462,30 @@ export class DevicesService {
 
     if (!device) throw new NotFoundException('Device not found');
 
-    await this.prisma.device.update({
-      where: { id: deviceId },
-      data: {
-        status: 'REVOKED',
-        revokedAt: new Date(),
-      },
+    const sessions = await this.prisma.$transaction(async tx => {
+      await tx.device.update({ where: { id: deviceId }, data: { status: 'REVOKED', revokedAt: new Date() } });
+      await tx.deviceKey.updateMany({ where: { deviceId }, data: { isActive: false } });
+      const active = await tx.remoteSession.findMany({ where: { deviceId,
+        state: { notIn: ['ENDED', 'REJECTED', 'EXPIRED', 'FAILED'] } } });
+      await tx.remoteSession.updateMany({ where: { id: { in: active.map(session => session.id) } },
+        data: { state: 'ENDED', endedAt: new Date(), endReason: 'Device access revoked' } });
+      return active;
     });
 
     // Invalidate Redis presence immediately
     const client = this.redis.getClient();
     await client.del(`krypton:presence:${deviceId}`);
+    await client.del(`krypton:device:key:${deviceId}`, `krypton:device:${deviceId}`);
+    for (const session of sessions) {
+      await client.del(`krypton:session:${session.id}`, `krypton:session:telemetry:${session.id}`);
+      for (const subject of [deviceId, session.viewerUserId]) {
+        await client.publish('krypton:signaling:messages', JSON.stringify({
+          targetTenantId: organizationId, targetSubjectId: subject,
+          message: { version: '1.0', type: 'SESSION_END', correlationId: crypto.randomUUID(), timestamp: Date.now(),
+            payload: { sessionId: session.id, reason: 'Device access revoked' } },
+        }));
+      }
+    }
 
     await this.audit.record({
       organizationId,

@@ -1,6 +1,23 @@
 import { z } from 'zod';
+export { fragmentFrame, FrameAssembler } from './video.js';
+export type { EncodedFrame } from './video.js';
 
 export const PROTOCOL_VERSION = '1.0';
+
+export const AccessClaimsSchema = z.object({
+  sub: z.string().min(1),
+  userId: z.string().min(1),
+  organizationId: z.string().min(1),
+  email: z.string().email(),
+  tokenUse: z.literal('access'),
+  mfaVerified: z.boolean(),
+  familyId: z.string().uuid(),
+}).refine(claims => claims.sub === claims.userId, 'Subject mismatch');
+
+export const GuestClaimsSchema = z.object({
+  sub: z.string().min(1), organizationId: z.string().min(1),
+  tokenUse: z.literal('guest-session'), sessionId: z.string().uuid(),
+});
 
 /**
  * Signaling Message Types (Section 2 & 26)

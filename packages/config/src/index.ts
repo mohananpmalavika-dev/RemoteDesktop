@@ -15,13 +15,15 @@ const ConfigSchema = z.object({
   SUPPORT_URL: z.string().url().default('https://support.kryptonlogic.com'),
 
   // Networking & Bindings
-  API_PORT: z.coerce.number().int().positive().default(4000),
+  API_PORT: z.coerce.number().int().min(1).max(65535).default(4000),
   API_HOST: z.string().default('0.0.0.0'),
   API_PUBLIC_URL: z.string().url().default('http://localhost:4000'),
+  CORS_ORIGINS: z.string().default(''),
+  TRUST_PROXY: z.enum(['true', 'false']).default('false').transform(value => value === 'true'),
 
-  SIGNALING_PORT: z.coerce.number().int().positive().default(4001),
+  SIGNALING_PORT: z.coerce.number().int().min(1).max(65535).default(4001),
   SIGNALING_HOST: z.string().default('0.0.0.0'),
-  SIGNALING_PUBLIC_URL: z.string().default('ws://localhost:4001/signaling'),
+  SIGNALING_PUBLIC_URL: z.string().url().default('ws://localhost:4001/signaling'),
 
   ADMIN_PORT: z.coerce.number().int().positive().default(3000),
 
@@ -32,8 +34,8 @@ const ConfigSchema = z.object({
   // Security & JWT
   JWT_ACCESS_SECRET: z.string().min(32, 'JWT_ACCESS_SECRET must be at least 32 characters'),
   JWT_REFRESH_SECRET: z.string().min(32, 'JWT_REFRESH_SECRET must be at least 32 characters'),
-  JWT_ACCESS_EXPIRATION: z.string().default('15m'),
-  JWT_REFRESH_EXPIRATION: z.string().default('7d'),
+  JWT_ACCESS_EXPIRATION: z.string().regex(/^[1-9]\d*(s|m|h|d)$/).default('15m'),
+  JWT_REFRESH_EXPIRATION: z.string().regex(/^[1-9]\d*(s|m|h|d)$/).default('7d'),
 
   DEVICE_ENROLLMENT_SIGNING_KEY: z.string().min(32, 'DEVICE_ENROLLMENT_SIGNING_KEY must be at least 32 characters'),
 
@@ -96,6 +98,25 @@ export function loadConfig(): KryptonConfig {
 
     if (config.TURN_SECRET.includes('dev_')) {
       throw new Error('[KryptonConfig] FATAL: Development TURN secret detected in production environment.');
+    }
+    for (const [name, value] of Object.entries({ API_PUBLIC_URL: config.API_PUBLIC_URL, SIGNALING_PUBLIC_URL: config.SIGNALING_PUBLIC_URL })) {
+      const url = new URL(value);
+      if (url.protocol !== (name === 'API_PUBLIC_URL' ? 'https:' : 'wss:') ||
+          forbiddenLocalSubstrings.some(host => url.hostname.includes(host)) || url.username || url.password) {
+        throw new Error(`[KryptonConfig] FATAL: Production ${name} must use a public secure URL.`);
+      }
+    }
+    for (const origin of config.CORS_ORIGINS.split(',').filter(Boolean)) {
+      const url = new URL(origin.trim());
+      if (url.protocol !== 'https:' || url.origin !== origin.trim()) throw new Error('[KryptonConfig] Invalid production CORS origin.');
+    }
+    if (/dev_|krypton_(prod|production|device)|change.?me|placeholder/i.test(config.DEVICE_ENROLLMENT_SIGNING_KEY + config.JWT_ACCESS_SECRET + config.JWT_REFRESH_SECRET + config.TURN_SECRET)) {
+      throw new Error('[KryptonConfig] FATAL: Placeholder production secrets detected.');
+    }
+    if (config.JWT_ACCESS_SECRET === config.JWT_REFRESH_SECRET) throw new Error('[KryptonConfig] JWT secrets must be distinct.');
+    for (const value of [...config.STUN_URLS.split(','), ...config.TURN_URLS.split(',')]) {
+      if (!/^(stun|stuns|turn|turns):[^\s/?]+(?::\d+)?(?:\?transport=(udp|tcp))?$/.test(value.trim()) ||
+          /localhost|127\.0\.0\.1|\[::1\]/i.test(value)) throw new Error('[KryptonConfig] Production ICE URLs must reference a configured public STUN/TURN server.');
     }
   }
 

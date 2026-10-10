@@ -456,7 +456,7 @@ export function DesktopHub(p: Props) {
                         <div style={{ marginTop: "8px", display: "flex", flexDirection: "column", gap: "6px" }}>
                           <label htmlFor="api-url" style={{ fontSize: "0.75rem" }}>Server URL</label>
                           <input id="api-url" type="url" value={apiUrl}
-                            placeholder="http://35.244.54.249:4000/api/v1" disabled={p.enrolling}
+                            placeholder="https://your-server.example/api/v1" disabled={p.enrolling}
                             onChange={(event) => setApiUrl(event.target.value)} />
                           <label htmlFor="enrollment-token" style={{ fontSize: "0.75rem" }}>Enrollment Token</label>
                           <input id="enrollment-token" type="password" value={enrollmentToken}

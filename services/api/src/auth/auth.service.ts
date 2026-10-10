@@ -13,6 +13,8 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { getConfig } from '@krypton/config';
 import { AuditAction } from '@krypton/shared-types';
+import { RedisService } from '../redis/redis.service';
+import { Prisma } from '@prisma/client';
 
 export interface TokenPayload {
   userId: string;
@@ -22,9 +24,11 @@ export interface TokenPayload {
 
 @Injectable()
 export class AuthService {
+  private dummyPasswordHash?: Promise<string>;
   constructor(
     private readonly prisma: PrismaService,
-    private readonly audit: AuditService
+    private readonly audit: AuditService,
+    private readonly redis: RedisService
   ) {}
 
   /**
@@ -59,7 +63,8 @@ export class AuthService {
     });
 
     if (!user) {
-      // Intentionally timing-safe error response
+      this.dummyPasswordHash ??= this.hashPassword(crypto.randomBytes(32).toString('hex'));
+      await this.verifyPassword(await this.dummyPasswordHash, passwordPlain);
       throw new UnauthorizedException({
         code: 'INVALID_CREDENTIALS',
         message: 'Invalid email/username or password.',
@@ -67,17 +72,9 @@ export class AuthService {
       });
     }
 
-    if (user.status !== 'ACTIVE') {
-      throw new UnauthorizedException({
-        code: 'ACCOUNT_SUSPENDED',
-        message: `Account is currently ${user.status}. Contact administrator.`,
-        retryable: false,
-      });
-    }
-
     const isValidPassword = await this.verifyPassword(user.passwordHash, passwordPlain);
 
-    if (!isValidPassword) {
+    if (!isValidPassword || user.status !== 'ACTIVE') {
       await this.audit.record({
         organizationId: user.organizationId,
         actorId: user.id,
@@ -88,7 +85,7 @@ export class AuthService {
         sourceIp: ipAddress,
         userAgent,
         result: 'FAILURE',
-        reason: 'Invalid password',
+      reason: 'Invalid credentials or inactive account',
       });
 
       throw new UnauthorizedException({
@@ -99,10 +96,13 @@ export class AuthService {
     }
 
     // Check if MFA is required
-    if (user.mfaEnabled && user.mfaSecret) {
+    if (user.mfaEnabled) {
+      if (!user.mfaSecret) throw new UnauthorizedException('MFA configuration is unavailable. Contact administrator.');
       const config = getConfig();
+      const challengeId = uuidv4();
+      await this.redis.getClient().setex(`krypton:mfa:challenge:${challengeId}`, 300, user.id);
       const mfaTempToken = jwt.sign(
-        { userId: user.id, mfaPending: true },
+        { userId: user.id, mfaPending: true, tokenUse: 'mfa', jti: challengeId },
         config.JWT_ACCESS_SECRET,
         { expiresIn: '5m' }
       );
@@ -146,7 +146,7 @@ export class AuthService {
     const config = getConfig();
     let decoded: any;
     try {
-      decoded = jwt.verify(mfaToken, config.JWT_ACCESS_SECRET);
+      decoded = jwt.verify(mfaToken, config.JWT_ACCESS_SECRET, { algorithms: ['HS256'] });
     } catch {
       throw new UnauthorizedException({
         code: 'MFA_SESSION_EXPIRED',
@@ -155,7 +155,7 @@ export class AuthService {
       });
     }
 
-    if (!decoded.mfaPending || !decoded.userId) {
+    if (!decoded.mfaPending || decoded.tokenUse !== 'mfa' || typeof decoded.userId !== 'string' || typeof decoded.jti !== 'string') {
       throw new UnauthorizedException('Invalid MFA token.');
     }
 
@@ -163,8 +163,9 @@ export class AuthService {
       where: { id: decoded.userId },
     });
 
-    if (!user || !user.mfaSecret) {
-      throw new NotFoundException('User or MFA configuration not found.');
+    if (!user || user.status !== 'ACTIVE' || !user.mfaEnabled || !user.mfaSecret ||
+        await this.redis.getClient().get(`krypton:mfa:challenge:${decoded.jti}`) !== user.id) {
+      throw new UnauthorizedException('User or MFA challenge is unavailable.');
     }
 
     const isCodeValid = authenticator.check(code, user.mfaSecret);
@@ -191,6 +192,10 @@ export class AuthService {
     }
 
     // MFA Validated successfully
+    const consumed = await this.redis.getClient().eval(
+      `if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end; return 0`,
+      1, `krypton:mfa:challenge:${decoded.jti}`, user.id);
+    if (Number(consumed) !== 1) throw new UnauthorizedException('MFA challenge was already used.');
     await this.audit.record({
       organizationId: user.organizationId,
       actorId: user.id,
@@ -203,7 +208,7 @@ export class AuthService {
       result: 'SUCCESS',
     });
 
-    const tokens = await this.issueTokens(user.id, user.organizationId, user.email, ipAddress, userAgent);
+    const tokens = await this.issueTokens(user.id, user.organizationId, user.email, ipAddress, userAgent, undefined, true);
 
     await this.prisma.user.update({
       where: { id: user.id },
@@ -219,10 +224,12 @@ export class AuthService {
   async generateMfaSecret(userId: string) {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw new NotFoundException('User not found');
+    if (user.mfaEnabled) throw new BadRequestException('MFA is already enabled.');
 
     const config = getConfig();
     const secret = authenticator.generateSecret();
     const otpAuthUrl = authenticator.keyuri(user.email, config.APP_NAME, secret);
+    await this.redis.getClient().setex(`krypton:mfa:setup:${userId}`, 600, secret);
 
     return { secret, otpAuthUrl };
   }
@@ -231,6 +238,10 @@ export class AuthService {
    * Activates MFA after user verifies first code
    */
   async activateMfa(userId: string, secret: string, code: string) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+    if (!user || user.mfaEnabled || await this.redis.getClient().get(`krypton:mfa:setup:${userId}`) !== secret) {
+      throw new BadRequestException('MFA setup is expired, invalid, or already enabled.');
+    }
     const isValid = authenticator.check(code, secret);
     if (!isValid) {
       throw new BadRequestException('MFA confirmation code is invalid.');
@@ -244,6 +255,8 @@ export class AuthService {
       },
     });
 
+    await this.redis.getClient().del(`krypton:mfa:setup:${userId}`);
+    await this.logoutAllDevices(userId);
     return { success: true };
   }
 
@@ -256,11 +269,14 @@ export class AuthService {
     email: string,
     ipAddress?: string,
     userAgent?: string,
-    existingFamilyId?: string
+    existingFamilyId?: string,
+    mfaVerified = false,
+    database: Prisma.TransactionClient = this.prisma
   ) {
     const config = getConfig();
 
-    const payload: TokenPayload = { userId, organizationId, email };
+    const familyId = existingFamilyId || uuidv4();
+    const payload = { userId, sub: userId, organizationId, email, tokenUse: 'access', mfaVerified, familyId };
 
     const accessToken = jwt.sign(payload, config.JWT_ACCESS_SECRET, {
       expiresIn: config.JWT_ACCESS_EXPIRATION as any,
@@ -268,22 +284,25 @@ export class AuthService {
 
     const rawRefreshToken = uuidv4() + '.' + crypto.randomBytes(32).toString('hex');
     const tokenHash = crypto.createHash('sha256').update(rawRefreshToken).digest('hex');
-    const familyId = existingFamilyId || uuidv4();
 
     // Refresh token expiry: 7 days default
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const duration = config.JWT_REFRESH_EXPIRATION;
+    const unitMs: Record<string, number> = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+    const expiresAt = new Date(Date.now() + Number(duration.slice(0, -1)) * unitMs[duration.slice(-1)]!);
 
-    await this.prisma.refreshToken.create({
+    const persistTokens = async (tx: Prisma.TransactionClient) => {
+    await tx.refreshToken.create({
       data: {
         userId,
         tokenHash,
         familyId,
         expiresAt,
+        mfaVerified,
       },
     });
 
     // Store user session record
-    await this.prisma.userSession.create({
+    await tx.userSession.create({
       data: {
         userId,
         sessionToken: tokenHash,
@@ -292,6 +311,9 @@ export class AuthService {
         expiresAt,
       },
     });
+    };
+    if (database === this.prisma) await this.prisma.$transaction(persistTokens);
+    else await persistTokens(database);
 
     return {
       accessToken,
@@ -334,21 +356,22 @@ export class AuthService {
       });
     }
 
-    // Revoke the old refresh token (rotate)
-    await this.prisma.refreshToken.update({
-      where: { id: storedToken.id },
-      data: { isRevoked: true },
+    if (storedToken.user.status !== 'ACTIVE') throw new UnauthorizedException('Account is not active.');
+    const rotated = await this.prisma.$transaction(async tx => {
+      const claimed = await tx.refreshToken.updateMany({
+        where: { id: storedToken.id, isRevoked: false, expiresAt: { gt: new Date() } },
+        data: { isRevoked: true },
+      });
+      if (claimed.count !== 1) return null;
+      await tx.userSession.deleteMany({ where: { sessionToken: tokenHash } });
+      return this.issueTokens(storedToken.userId, storedToken.user.organizationId,
+        storedToken.user.email, ipAddress, userAgent, storedToken.familyId, storedToken.mfaVerified, tx);
     });
-
-    // Issue a new token pair preserving the familyId
-    return this.issueTokens(
-      storedToken.userId,
-      storedToken.user.organizationId,
-      storedToken.user.email,
-      ipAddress,
-      userAgent,
-      storedToken.familyId
-    );
+    if (!rotated) {
+      await this.prisma.refreshToken.updateMany({ where: { familyId: storedToken.familyId }, data: { isRevoked: true } });
+      throw new UnauthorizedException('Refresh token was already used. Log in again.');
+    }
+    return rotated;
   }
 
   /**
@@ -356,8 +379,9 @@ export class AuthService {
    */
   async logout(rawRefreshToken: string) {
     const tokenHash = crypto.createHash('sha256').update(rawRefreshToken).digest('hex');
+    const token = await this.prisma.refreshToken.findUnique({ where: { tokenHash } });
     await this.prisma.refreshToken.updateMany({
-      where: { tokenHash },
+      where: token ? { familyId: token.familyId } : { tokenHash },
       data: { isRevoked: true },
     });
     await this.prisma.userSession.deleteMany({

@@ -1,133 +1,44 @@
 # KryptonRemote
 
-**Enterprise-Grade Windows Remote Desktop Platform**  
-*Built by KryptonLogic Corp*
+Windows remote support application with a browser viewer and an administration console.
 
-KryptonRemote is an enterprise-grade Windows remote support and desktop management platform engineered for zero-trust security environments, high-performance WebRTC streaming, and compliance auditing.
+Release status: hardening changes implemented; release acceptance tests remain pending. See [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for verified results and limitations.
 
----
+## Supported release scope
 
-## Key Capabilities
+- Windows host enrollment with a single-use token and persisted Ed25519 identity.
+- Public browser connections by Remote ID, with explicit host consent and individual permissions.
+- Authenticated administration: organization registration, login, MFA setup, rotating refresh tokens, device inventory/revocation, policy management, active sessions, and audit verification.
+- Native DXGI screen capture and software H.264 encoding delivered over encrypted WebRTC data channels. The viewer requires WebCodecs support in a secure browser context.
+- Remote keyboard/mouse input, text clipboard, and checksum-verified file transfers. Browser transfers are capped at 100 MB and also respect the workspace limit.
 
-- **Real WebRTC Transport (P2P + TURN):** RFC 6184 H.264 RTP packetization and depacketization, FU-A fragmentation, 90kHz timestamp conversion, multiplexed SCTP DataChannels (`remote-control`, `clipboard`, `file-transfer`, `telemetry`, `session-control`), and automated failover from direct UDP to authenticated Coturn relay.
-- **Cryptographic Device Identity & Signaling Security:** Challenge-response nonce authentication via Ed25519 signatures for devices and Argon2id-derived JWTs for technicians. Sockets are strictly bound to authenticated contexts with full tenant and channel isolation.
-- **Tamper-Evident Merkle Audit Logging:** Every security and remote action is recorded with SHA-256 Merkle hash chaining (`eventHash = SHA256(canonicalPayload + previousHash)`). Fully verifiable via `GET /api/v1/audit/verify`.
-- **Zero-Credential Exposure (Section 28):** Passwords, JWTs, private keys, and clipboard payloads are recursively purged before persistence.
-- **Hardened Windows Host Agent:** DXGI Desktop Duplication, pure-Rust H.264 software encoding with Annex-B start codes, dynamic hardware encoder probing (NVENC/QSV/AMF), multi-monitor display switching, Win32 `SendInput` coordinate normalization, Win32 Service Control Manager (SCM) integration with auto-recovery, and live telemetry (CPU, RAM, Disk, active console session).
-- **Productivity Suite:** Attended host consent dialog with granular permissions, bi-directional and client-to-host clipboard synchronization, and resumable chunked file transfers (64KB chunks with end-to-end SHA-256 verification).
-- **Zero Mock State:** All sample data, mock timers, and fake fallbacks removed across the production codebase.
+Session recording, unattended access, audio, secure attention/UAC desktop control, and user invitations/password recovery are outside the current release implementation. Multi-monitor switching and cross-network performance require further work and acceptance evidence.
 
----
+## Local development
 
-## Monorepo Architecture
+Use Node.js 22.18 or newer, npm, Rust, the Windows build tools/WebView2 for the desktop app, and Docker for PostgreSQL/Redis/Coturn.
 
-```
-KryptonRemote/
-├── apps/
-│   ├── admin-web/       # React 19 + Vite Enterprise Administration Portal
-│   └── desktop/         # Tauri 2 + React Windows Host Agent & Viewer Client
-├── crates/
-│   ├── capture/         # DXGI Desktop Duplication & frame acquisition
-│   ├── clipboard/       # System clipboard polling, hashing & injection
-│   ├── device-identity/ # Ed25519 keypair generation & 9-digit Remote ID
-│   ├── encoder/         # Pure-Rust H.264 encoder & Adaptive Quality Controller
-│   ├── file-transfer/   # Resumable chunked file transfer with SHA-256
-│   ├── input/           # Win32 SendInput injection & coordinate mapping
-│   ├── platform-windows/# Windows SCM service, UAC elevation & live telemetry
-│   ├── remote-core/     # Engine lifecycle & session state machine
-│   └── transport/       # WebRTC peer connection, RTP packetizer & DataChannels
-├── docs/                # Enterprise documentation, threat models & runbooks
-├── packages/
-│   ├── config/          # Fail-fast environment variable validation
-│   ├── logger/          # Structured Pino logging with redaction
-│   ├── protocol/        # Zod-validated signaling message schemas
-│   └── shared-types/    # TypeScript types & RBAC permissions
-├── prisma/              # PostgreSQL schema & durable migrations
-└── services/
-    ├── api/             # NestJS 10 REST Control Plane
-    └── signaling/       # Cryptographic WebSocket WebRTC signaling server
-```
-
----
-
-## Quick Start
-
-### 1. Prerequisites
-- **OS:** Windows 10/11 or Windows Server (x86_64)
-- **Node.js:** v20+ & npm 10+
-- **Rust:** 1.80+ (toolchain: `x86_64-pc-windows-gnu` or `x86_64-pc-windows-msvc`)
-- **Docker & Docker Compose:** for infrastructure dependencies
-
-### 2. Infrastructure Setup
-```bash
-# Clone and enter directory
-git clone https://github.com/KryptonLogic/KryptonRemote.git
-cd KryptonRemote
-
-# Copy environment variables
-cp .env.example .env
-
-# Start PostgreSQL, Redis, and Coturn
+```powershell
+Copy-Item .env.example .env
+npm ci
+npm run prisma:generate
 docker compose -f infra/docker-compose.yml up -d
-
-# Apply database schema
 npx prisma migrate deploy
+npm run build
 ```
 
-### 3. Build & Run Microservices
-```bash
-# Install dependencies
-npm install
+Run `npm run start --workspace=@krypton/api`, `npm run start --workspace=@krypton/signaling`, and `npm run dev --workspace=@krypton/admin-web` in separate terminals. Run `npm run tauri:dev` for the Windows application. Create an organization in the browser account panel, generate a device enrollment token, and register the host using the server URL and token. Enrollment is required before sharing a Remote ID.
 
-# Start API control plane
-cd services/api && npm run start:dev
-
-# Start Signaling cluster
-cd services/signaling && npm run start:dev
-
-# Start Admin Web Portal
-cd apps/admin-web && npm run dev
-```
-
-### 4. Build Windows Desktop Agent
-```bash
-cd apps/desktop
-npm run tauri dev
-```
-
----
-
-## Running the Automated Test Suite
-
-```bash
-# 1. Run all Node.js / TypeScript microservice tests (23 tests):
+```powershell
+npm run typecheck
 npm test
-
-# 2. Run all native Rust workspace tests (53 tests):
-cargo test --workspace
-
-# 3. Validate frontend production builds:
-cd apps/admin-web && npm run build
-cd apps/desktop && npm run build
+cargo check --workspace --locked
+cargo test --workspace --locked
+npm audit
 ```
 
----
+`npm run test:integration` launches the built API/signaling services against explicitly supplied disposable PostgreSQL/Redis instances. It requires `KRYPTON_TEST_DATABASE=disposable`, `DATABASE_URL`, and `REDIS_URL`. The CI workflow provisions these automatically. Windows CI skips the three tests that require an interactive display/clipboard; run the full native suite on a Windows desktop before release.
 
-## Enterprise Documentation
+## Production deployment
 
-- [Capability Matrix & Production Readiness](file:///C:/RemoteDesktop/docs/CAPABILITY_MATRIX.md)
-- [Security Architecture & Standards](file:///C:/RemoteDesktop/docs/SECURITY.md)
-- [Threat Model & STRIDE Analysis](file:///C:/RemoteDesktop/docs/THREAT_MODEL.md)
-- [Enterprise Deployment Guide](file:///C:/RemoteDesktop/docs/DEPLOYMENT.md)
-- [Operations & Runbook](file:///C:/RemoteDesktop/docs/OPERATIONS.md)
-- [Automated Test Matrix](file:///C:/RemoteDesktop/docs/TEST_MATRIX.md)
-- [Network & Firewall Requirements](file:///C:/RemoteDesktop/docs/NETWORK_REQUIREMENTS.md)
-- [Coturn Deployment & Configuration](file:///C:/RemoteDesktop/docs/TURN_DEPLOYMENT.md)
-- [Windows Host Agent & Service Guide](file:///C:/RemoteDesktop/docs/WINDOWS_AGENT.md)
-
----
-
-## License
-
-Copyright © 2026 KryptonLogic Corp. All rights reserved.
-Commercial Enterprise Software.
+Follow [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). Production Compose builds the frontend inside the API image, applies versioned migrations, uses private database/cache networks, and terminates HTTPS/WSS with Caddy. Supply a real domain, public TURN address, and independently generated secrets. Existing installations created with `prisma db push` need a reviewed migration baseline before deployment.

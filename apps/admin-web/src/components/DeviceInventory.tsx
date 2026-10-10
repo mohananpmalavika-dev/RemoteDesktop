@@ -103,8 +103,7 @@ export const DeviceInventory: React.FC<DeviceInventoryProps> = ({ onConnect }) =
 
   const handleCopyToken = () => {
     if (generatedToken) {
-      navigator.clipboard.writeText(generatedToken);
-      setCopied(true);
+      navigator.clipboard.writeText(generatedToken).then(() => setCopied(true)).catch(() => setActionNotice("Could not copy the token. Copy it manually."));
       setTimeout(() => setCopied(false), 2500);
     }
   };
@@ -650,8 +649,8 @@ export const DeviceInventory: React.FC<DeviceInventoryProps> = ({ onConnect }) =
                               marginBottom: "3px",
                             }}
                           >
-                            <span>CPU: {device.cpuPercent}%</span>
-                            <span>RAM: {device.memoryPercent}%</span>
+                            <span>CPU: {device.cpuPercent?.toFixed(1) ?? 'N/A'}%</span>
+                            <span>RAM: {device.memoryPercent?.toFixed(1) ?? 'N/A'}%</span>
                           </div>
                           <div
                             style={{
@@ -663,10 +662,10 @@ export const DeviceInventory: React.FC<DeviceInventoryProps> = ({ onConnect }) =
                           >
                             <div
                               style={{
-                                width: `${device.cpuPercent}%`,
+                                width: `${device.cpuPercent ?? 0}%`,
                                 height: "100%",
                                 backgroundColor:
-                                  device.cpuPercent > 80
+                                  (device.cpuPercent ?? 0) > 80
                                     ? "#ef4444"
                                     : "var(--brand)",
                               }}
@@ -710,7 +709,7 @@ export const DeviceInventory: React.FC<DeviceInventoryProps> = ({ onConnect }) =
                       >
                         <button
                           title="Initiate Remote Connect"
-                          disabled={device.status === "OFFLINE"}
+                          disabled={device.status !== "ONLINE"}
                           onClick={() => onConnect?.(device.remoteId)}
                           style={{
                             display: "flex",

@@ -13,14 +13,14 @@ import {
 import { adminApi, TenantPolicyDto } from "../api/client";
 
 export const TenantPolicyManager: React.FC = () => {
-  const [requireMfa, setRequireMfa] = useState(true);
+  const [requireMfa, setRequireMfa] = useState(false);
   const [enforceConsent, setEnforceConsent] = useState(true);
   const [idleTimeoutMin, setIdleTimeoutMin] = useState(15);
   const [clipboardPolicy, setClipboardPolicy] = useState<
     "BIDIRECTIONAL" | "CLIENT_TO_HOST" | "DISABLED"
   >("BIDIRECTIONAL");
   const [maxFileMb, setMaxFileMb] = useState(500);
-  const [sessionRecording, setSessionRecording] = useState(true);
+  const [sessionRecording, setSessionRecording] = useState(false);
   const [savedNotice, setSavedNotice] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -32,14 +32,15 @@ export const TenantPolicyManager: React.FC = () => {
         setError(null);
         const policies = await adminApi.getPolicies();
         if (policies) {
-          setRequireMfa(policies.requireMfa ?? true);
+          setRequireMfa(policies.requireMfa ?? false);
           setEnforceConsent(policies.enforceConsent ?? true);
           setIdleTimeoutMin(policies.idleTimeoutMin ?? 15);
           setClipboardPolicy(policies.clipboardPolicy || "BIDIRECTIONAL");
           setMaxFileMb(policies.maxFileMb ?? 500);
-          setSessionRecording(policies.sessionRecording ?? true);
+          setSessionRecording(policies.sessionRecording ?? false);
         }
       } catch (err: any) {
+        setError(err.message || "Could not load the workspace policy.");
         console.warn(
           "Failed to load policies from API, using default policy values:",
           err,
@@ -100,7 +101,7 @@ export const TenantPolicyManager: React.FC = () => {
         >
           <CheckCircle2 size={18} />
           Organization Security Policies successfully committed to PostgreSQL.
-          Applied immediately to all fleet agents.
+          New sessions use the updated policy.
         </div>
       )}
 
@@ -226,7 +227,7 @@ export const TenantPolicyManager: React.FC = () => {
             </div>
             <input
               type="checkbox"
-              checked={enforceConsent}
+              disabled checked={enforceConsent}
               onChange={(e) => setEnforceConsent(e.target.checked)}
               style={{
                 width: "18px",
@@ -417,7 +418,7 @@ export const TenantPolicyManager: React.FC = () => {
             </div>
             <input
               type="checkbox"
-              checked={sessionRecording}
+              disabled checked={sessionRecording}
               onChange={(e) => setSessionRecording(e.target.checked)}
               style={{
                 width: "18px",

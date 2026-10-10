@@ -6,6 +6,7 @@ import {
   Body,
   Req,
   UseGuards,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { SessionsService, CreateSessionDto } from './sessions.service';
 import { IceCredentialsService } from './ice-credentials.service';
@@ -14,6 +15,7 @@ import { Public } from '../auth/public.decorator';
 import { RequirePermissions } from '../rbac/permissions.decorator';
 import { PermissionsGuard } from '../rbac/permissions.guard';
 import { KryptonPermission, SessionCapabilities } from '@krypton/shared-types';
+import { DeviceAuthGuard } from '../auth/device-auth.guard';
 
 @Controller('sessions')
 @UseGuards(PermissionsGuard)
@@ -39,7 +41,8 @@ export class SessionsController {
       user.organizationId,
       dto,
       ip,
-      userAgent
+      userAgent,
+      user.mfaVerified
     );
   }
 
@@ -51,8 +54,8 @@ export class SessionsController {
 
   @Get(':id')
   @RequirePermissions(KryptonPermission.REMOTE_SCREEN_VIEW)
-  async getSession(@Param('id') sessionId: string) {
-    return this.sessionsService.getSession(sessionId);
+  async getSession(@CurrentUser() user: any, @Param('id') sessionId: string) {
+    return this.sessionsService.getSession(sessionId, user.organizationId);
   }
 
   @Post(':id/terminate')
@@ -62,27 +65,29 @@ export class SessionsController {
     @Param('id') sessionId: string,
     @Body('reason') reason?: string
   ) {
-    return this.sessionsService.terminateSession(sessionId, user.id, reason);
+    return this.sessionsService.terminateSession(sessionId, user.id, user.organizationId, reason);
   }
 
   @Public()
   @Post(':id/accept')
+  @UseGuards(DeviceAuthGuard)
   async acceptSession(
     @Param('id') sessionId: string,
     @Body('capabilities') capabilities: SessionCapabilities,
-    @Body('deviceId') deviceId?: string
+    @Req() req: any
   ) {
-    return this.sessionsService.acceptSession(sessionId, capabilities, deviceId);
+    return this.sessionsService.acceptSession(sessionId, capabilities, req.device.id);
   }
 
   @Public()
   @Post(':id/reject')
+  @UseGuards(DeviceAuthGuard)
   async rejectSession(
     @Param('id') sessionId: string,
-    @Body('reason') reason?: string,
-    @Body('deviceId') deviceId?: string
+    @Body('reason') reason: string | undefined,
+    @Req() req: any
   ) {
-    return this.sessionsService.rejectSession(sessionId, reason, deviceId);
+    return this.sessionsService.rejectSession(sessionId, reason, req.device.id);
   }
 
   @Post(':id/end')
@@ -91,12 +96,13 @@ export class SessionsController {
     @Param('id') sessionId: string,
     @Body('reason') reason?: string
   ) {
-    return this.sessionsService.endSession(sessionId, user.id, reason);
+    return this.sessionsService.endSession(sessionId, user.id, user.organizationId, reason);
   }
 
   @Get(':id/ice-servers')
   @RequirePermissions(KryptonPermission.REMOTE_SESSION_CREATE)
-  async getIceServers(@CurrentUser() user: any) {
+  async getIceServers(@CurrentUser() user: any, @Param('id') sessionId: string) {
+    await this.sessionsService.getSession(sessionId, user.organizationId);
     return this.iceService.generateIceConfiguration(user.id);
   }
 
@@ -111,9 +117,24 @@ export class SessionsController {
     return this.sessionsService.quickConnect(dto, ip, userAgent);
   }
 
-  @Public()
+  @RequirePermissions(KryptonPermission.REMOTE_SESSION_CREATE)
   @Get('public/ice-servers')
   async getPublicIceServers() {
     return this.iceService.generateIceConfiguration('web-guest');
+  }
+
+  @Public()
+  @Post(':id/host-state')
+  @UseGuards(DeviceAuthGuard)
+  async updateHostState(@Param('id') id: string, @Body() body: unknown, @Req() req: any) {
+    return this.sessionsService.updateHostState(id, req.device.id, body);
+  }
+
+  @Public()
+  @Post(':id/guest-end')
+  async endGuestSession(@Param('id') id: string, @Req() req: any) {
+    const auth = req.headers.authorization;
+    if (typeof auth !== 'string' || !/^Bearer \S+$/.test(auth)) throw new UnauthorizedException('Session token is required');
+    return this.sessionsService.endGuestSession(id, auth.slice(7));
   }
 }

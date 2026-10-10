@@ -12,9 +12,14 @@ import {
   Activity,
 } from "lucide-react";
 import { ConnectionLaunch } from "./ConnectionLaunch";
-import { SignalingMessageType, PROTOCOL_VERSION } from "@krypton/protocol";
+import { SignalingMessageType, PROTOCOL_VERSION, FrameAssembler, EncodedFrame } from "@krypton/protocol";
+
+import { FileSender, FileReceiver } from "../api/fileTransfer";
+import { API_BASE, getAuthToken, apiRequest } from "../api/client";
 
 interface WebRemoteViewerProps {
+  apiBase?: string;
+  autoConnect?: boolean;
   initialRemoteId?: string;
   onClose?: () => void;
 }
@@ -29,8 +34,26 @@ interface TelemetryStats {
 
 export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
   initialRemoteId = "",
+  apiBase = API_BASE,
+  autoConnect = false,
   onClose,
 }) => {
+  const native = '__TAURI_INTERNALS__' in window;
+  const viewerRequest = async (path: string, body: object, token?: string, signal?: AbortSignal) => {
+    if (native) {
+      const { invoke } = await import('@tauri-apps/api/core');
+      return invoke<any>('viewer_api_request', { apiUrl: apiBase, path, body, token: token || null });
+    }
+    if (token && token === getAuthToken() && apiBase === API_BASE) {
+      return apiRequest<any>(path, { method: 'POST', signal, body: JSON.stringify(body), keepalive: path.endsWith('/end') });
+    }
+    const response = await fetch(`${apiBase}${path}`, { method: 'POST', signal, headers: {
+      'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    }, body: JSON.stringify(body), keepalive: path.endsWith('/end') || path.endsWith('/guest-end') });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.message || `API error ${response.status}`);
+    return result;
+  };
   const [remoteIdInput, setRemoteIdInput] = useState<string>(initialRemoteId);
   const [pinInput, setPinInput] = useState<string>("");
   const [connectionState, setConnectionState] = useState<
@@ -71,11 +94,27 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
   const controlChannelRef = useRef<RTCDataChannel | null>(null);
   const clipboardChannelRef = useRef<RTCDataChannel | null>(null);
   const sequenceRef = useRef<number>(1);
+  const fileSenderRef = useRef<FileSender | null>(null);
+  const downloadsRef = useRef<string[]>([]);
+  const [downloads, setDownloads] = useState<{ name: string; url: string }[]>([]);
+  const fileReceiverRef = useRef<FileReceiver | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [fileProgress, setFileProgress] = useState<string>('');
   const sessionIdRef = useRef<string>("");
   const statsTimerRef = useRef<any>(null);
   const frameCountRef = useRef<number>(0);
   const lastFpsTimestampRef = useRef<number>(performance.now());
   const decoderRef = useRef<VideoDecoder | null>(null);
+  const assemblerRef = useRef(new FrameAssembler());
+  const sessionTokenRef = useRef<string>('');
+  const guestRef = useRef(false);
+  const attemptRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
+  const connectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const candidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const capabilitiesRef = useRef({ screenView: false, control: false, clipboard: false, fileTransfer: false });
+  const [acceptedCaps, setAcceptedCaps] = useState(capabilitiesRef.current);
+  const [decodedVideo, setDecodedVideo] = useState(false);
 
   // Sequence generator for DataChannel messages
   const nextSeq = useCallback(() => {
@@ -97,6 +136,20 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
 
   // Close connection cleanly
   const disconnect = useCallback(() => {
+    for (const url of downloadsRef.current) URL.revokeObjectURL(url); downloadsRef.current = []; setDownloads([]);
+    fileReceiverRef.current?.clear(); fileReceiverRef.current = null;
+    fileSenderRef.current?.close(); fileSenderRef.current = null; setFileProgress('');
+    attemptRef.current++;
+    abortRef.current?.abort(); abortRef.current = null;
+    if (connectTimeoutRef.current) clearTimeout(connectTimeoutRef.current);
+    connectTimeoutRef.current = null;
+    const sessionId = sessionIdRef.current;
+    if (sessionId && sessionTokenRef.current) {
+      void viewerRequest(`/sessions/${sessionId}/${guestRef.current ? 'guest-end' : 'end'}`, {}, sessionTokenRef.current).catch(() => {});
+    }
+    sessionIdRef.current = ''; sessionTokenRef.current = ''; candidatesRef.current = [];
+    assemblerRef.current.clear(); capabilitiesRef.current = { screenView: false, control: false, clipboard: false, fileTransfer: false };
+    setAcceptedCaps(capabilitiesRef.current); setDecodedVideo(false);
     if (statsTimerRef.current) {
       clearInterval(statsTimerRef.current);
       statsTimerRef.current = null;
@@ -142,7 +195,7 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
 
     setConnectionState("DISCONNECTED");
     setStatusMessage("");
-  }, []);
+  }, [apiBase]);
 
   useEffect(() => {
     return () => {
@@ -152,6 +205,7 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
 
   // Send Remote Control message over RTCDataChannel
   const sendControlMessage = useCallback((msg: any) => {
+    if (!capabilitiesRef.current.control) return;
     if (
       !controlChannelRef.current ||
       controlChannelRef.current.readyState !== "open"
@@ -291,6 +345,7 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
 
   // Clipboard sync
   const sendClipboardText = (text: string) => {
+    if (!capabilitiesRef.current.clipboard || new TextEncoder().encode(text).length > 1_048_576) return;
     if (
       !clipboardChannelRef.current ||
       clipboardChannelRef.current.readyState !== "open"
@@ -330,51 +385,29 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
       return;
     }
 
+    disconnect();
+    const attempt = attemptRef.current;
+    const controller = new AbortController(); abortRef.current = controller;
     setErrorMessage(null);
     setConnectionState("AUTHENTICATING");
     setStatusMessage("Initiating secure session with API...");
 
     try {
-      // 1. Call API quick-connect endpoint
-      const apiHost = window.location.hostname || "localhost";
-      const apiPort =
-        window.location.port === "4000" || window.location.port === ""
-          ? "4000"
-          : window.location.port;
-      const apiUrl = `${window.location.protocol}//${apiHost}:${apiPort}/api/v1/sessions/quick-connect`;
-
-      const response = await fetch(apiUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          targetRemoteId: cleanId,
-          pin: pinInput || undefined,
-        }),
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.message || `API error ${response.status}`);
+      let token = native ? null : getAuthToken();
+      const sessionData = await viewerRequest(`/sessions/${token ? '' : 'quick-connect'}`,
+        token ? { targetRemoteId: cleanId, requestedCapabilities: { screenView: true, control: true, clipboard: true, fileTransfer: true, audioListen: false } } : { targetRemoteId: cleanId, pin: pinInput || undefined },
+        token || undefined, controller.signal);
+      if (token) token = getAuthToken();
+      if (attempt !== attemptRef.current) {
+        void viewerRequest(`/sessions/${sessionData.sessionId}/${token ? 'end' : 'guest-end'}`, {}, token || sessionData.accessToken).catch(() => {}); return;
       }
-
-      const sessionData = await response.json();
       sessionIdRef.current = sessionData.sessionId;
-
-      setConnectionState("SIGNALING");
-      setStatusMessage("Connecting to real-time WebRTC signaling gateway...");
-
-      // 2. Establish WebSocket connection to Signaling gateway
-      const signalingUrl = sessionData.signalingUrl || `ws://${apiHost}:4001`;
-      const wsUrl = signalingUrl.endsWith("/signaling")
-        ? signalingUrl
-        : `${signalingUrl}/signaling`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      // 3. Create WebRTC PeerConnection with provided STUN/TURN ICE servers
-      const iceServers = sessionData.iceConfiguration?.iceServers || [
-        { urls: [`stun:${apiHost}:3478`, "stun:stun.l.google.com:19302"] },
-      ];
+      guestRef.current = !token; sessionTokenRef.current = token || sessionData.accessToken;
+      setConnectionState('SIGNALING'); setStatusMessage('Waiting for the host to approve this session...');
+      connectTimeoutRef.current = setTimeout(() => { disconnect(); setErrorMessage('Host approval or connection timed out. Try again.'); }, 300_000);
+      if (!sessionData.signalingUrl) throw new Error('The server did not provide a signaling URL.');
+      const ws = new WebSocket(sessionData.signalingUrl); wsRef.current = ws;
+      const iceServers = sessionData.iceConfiguration.iceServers;
 
       const pc = new RTCPeerConnection({
         iceServers,
@@ -400,12 +433,25 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
       clipboardChannel.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          if (data && data.text) {
+          if (data && typeof data.text === "string" && capabilitiesRef.current.clipboard) {
             setClipboardText(data.text);
           }
         } catch {}
       };
 
+      const fileChannel = pc.createDataChannel('file-transfer', { ordered: true });
+      const fileSender = new FileSender(fileChannel); fileSenderRef.current = fileSender;
+      const fileReceiver = new FileReceiver(fileChannel, (name, blob) => {
+        const url = URL.createObjectURL(blob); downloadsRef.current.push(url); setDownloads(previous => [...previous, { name, url }]);
+      }); fileReceiverRef.current = fileReceiver;
+      let fileQueue = Promise.resolve();
+      fileChannel.onmessage = event => {
+        fileQueue = fileQueue.then(async () => {
+          if (!capabilitiesRef.current.fileTransfer || typeof event.data !== 'string' || event.data.length > 65536) return;
+          const message = JSON.parse(event.data); if (!fileSender.onMessage(message)) await fileReceiver.onMessage(message);
+        }).catch(error => { if (fileChannel.readyState === 'open') fileChannel.send(JSON.stringify({ action: 'error', message: String(error) })); setFileProgress(String(error)); });
+      };
+      fileChannel.onclose = () => fileSender.close();
       const telemetryChannel = pc.createDataChannel("telemetry", {
         ordered: false,
         maxRetransmits: 0,
@@ -444,9 +490,10 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
         );
         if (event.channel.label === "video") {
           // Hardware H.264 WebCodecs packet stream
-          initWebCodecsDecoder();
+          event.channel.binaryType = "arraybuffer";
           event.channel.onmessage = (msgEvent) => {
-            handleEncodedVideoChunk(msgEvent.data);
+            try { const frame = assemblerRef.current.push(msgEvent.data); if (frame) handleEncodedVideoChunk(frame); }
+            catch (error) { setErrorMessage(String(error)); }
           };
         }
       };
@@ -474,7 +521,9 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
       // Connection State Changes
       pc.onconnectionstatechange = () => {
         console.info("[WebRTC] Connection state changed:", pc.connectionState);
+        if (attempt !== attemptRef.current) return;
         if (pc.connectionState === "connected") {
+          if (connectTimeoutRef.current) clearTimeout(connectTimeoutRef.current);
           setConnectionState("CONNECTED");
           setStatusMessage("Connected. Real-time control active.");
           startTelemetryMonitoring(pc);
@@ -482,12 +531,18 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
           setConnectionState("CONNECTING");
           setStatusMessage("Negotiating peer-to-peer route...");
         } else if (pc.connectionState === "failed") {
-          setConnectionState("FAILED");
+          disconnect(); setConnectionState("FAILED");
           setErrorMessage(
             "Peer connection failed. Check host availability and firewall.",
           );
         } else if (pc.connectionState === "disconnected") {
           setStatusMessage("Connection interrupted. Attempting reconnect...");
+          if (connectTimeoutRef.current) clearTimeout(connectTimeoutRef.current);
+          connectTimeoutRef.current = setTimeout(() => {
+            if (attempt === attemptRef.current && pc.connectionState === 'disconnected') {
+              disconnect(); setErrorMessage('The connection could not recover. Start a new support session.');
+            }
+          }, 15_000);
         }
       };
 
@@ -498,7 +553,10 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
         );
       };
 
-      ws.onmessage = async (event) => {
+      let processing = Promise.resolve();
+      ws.onmessage = (event) => {
+        processing = processing.then(async () => {
+        if (attempt !== attemptRef.current) return;
         try {
           const msg = JSON.parse(event.data);
 
@@ -512,62 +570,33 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
                 timestamp: Date.now(),
                 payload: {
                   subjectType: "USER",
-                  accessToken: sessionData.accessToken,
+                  accessToken: sessionTokenRef.current,
                 },
               }),
             );
             return;
           }
 
-          // 2. Auth Success -> Send Session Request and SDP Offer
           if (msg.type === SignalingMessageType.AUTH_SUCCESS) {
-            setStatusMessage("Creating WebRTC offer for Host...");
-
-            // Create Offer
-            const offer = await pc.createOffer({
-              offerToReceiveVideo: true,
-              offerToReceiveAudio: false,
-            });
-            await pc.setLocalDescription(offer);
-
-            // Send Session Request with capabilities
-            ws.send(
-              JSON.stringify({
-                version: PROTOCOL_VERSION,
-                type: SignalingMessageType.SESSION_REQUEST,
-                correlationId: crypto.randomUUID(),
-                timestamp: Date.now(),
-                payload: {
-                  sessionId: sessionIdRef.current,
-                  viewerUserId: msg.payload.subjectId,
-                  viewerName: "Web Viewer",
-                  organizationName: "Krypton Remote Cloud",
-                  targetDeviceId: sessionData.targetDeviceId,
-                  requestedCapabilities: {
-                    screenView: true,
-                    control: true,
-                    clipboard: true,
-                    fileTransfer: true,
-                    audioListen: false,
-                  },
-                },
-              }),
-            );
-
-            // Dispatch SDP Offer
-            ws.send(
-              JSON.stringify({
-                version: PROTOCOL_VERSION,
-                type: SignalingMessageType.OFFER,
-                correlationId: crypto.randomUUID(),
-                timestamp: Date.now(),
-                payload: {
-                  sessionId: sessionIdRef.current,
-                  sdp: offer.sdp,
-                },
-              }),
-            );
+            ws.send(JSON.stringify({ version: PROTOCOL_VERSION, type: SignalingMessageType.SESSION_REQUEST,
+              correlationId: crypto.randomUUID(), timestamp: Date.now(), payload: {
+                sessionId: sessionData.sessionId, viewerUserId: msg.payload.subjectId, viewerName: 'Viewer',
+                organizationName: 'Workspace', targetDeviceId: sessionData.targetDeviceId,
+                requestedCapabilities: sessionData.requestedCapabilities,
+              } }));
             return;
+          }
+          if (msg.type === SignalingMessageType.SESSION_ACCEPT) {
+            if (msg.payload.sessionId !== sessionIdRef.current || pc.localDescription) return;
+            capabilitiesRef.current = msg.payload.acceptedCapabilities; setAcceptedCaps(msg.payload.acceptedCapabilities);
+            setStatusMessage('Host approved. Negotiating an encrypted connection...');
+            const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
+            ws.send(JSON.stringify({ version: PROTOCOL_VERSION, type: SignalingMessageType.OFFER,
+              correlationId: crypto.randomUUID(), timestamp: Date.now(), payload: { sessionId: sessionData.sessionId, sdp: offer.sdp } }));
+            return;
+          }
+          if (msg.type === SignalingMessageType.SESSION_REJECT) {
+            disconnect(); setErrorMessage(msg.payload.reason || 'The host declined this session.'); return;
           }
 
           // 3. Receive SDP Answer from Host
@@ -581,6 +610,7 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
                 sdp: msg.payload.sdp,
               }),
             );
+            for (const candidate of candidatesRef.current.splice(0)) await pc.addIceCandidate(candidate);
             return;
           }
 
@@ -588,13 +618,9 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
           if (msg.type === SignalingMessageType.ICE_CANDIDATE) {
             const cand = msg.payload;
             if (cand && cand.candidate) {
-              await pc.addIceCandidate(
-                new RTCIceCandidate({
-                  candidate: cand.candidate,
-                  sdpMid: cand.sdpMid,
-                  sdpMLineIndex: cand.sdpMLineIndex,
-                }),
-              );
+              const candidate = { candidate: cand.candidate, sdpMid: cand.sdpMid, sdpMLineIndex: cand.sdpMLineIndex };
+              if (pc.remoteDescription) await pc.addIceCandidate(candidate);
+              else if (candidatesRef.current.length < 128) candidatesRef.current.push(candidate);
             }
             return;
           }
@@ -614,76 +640,65 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
             );
           }
         } catch (err: any) {
-          console.error("[Signaling] Parse error:", err);
+          disconnect(); setErrorMessage(err.message || "Signaling failed.");
         }
+        }).catch(error => { disconnect(); setErrorMessage(String(error)); });
       };
 
       ws.onerror = (err) => {
+        if (attempt !== attemptRef.current) return;
+        disconnect();
         console.error("[Signaling] WebSocket error:", err);
         setErrorMessage(
-          "Signaling WebSocket connection failed. Verify port 4001 ingress.",
+          "Could not reach the support service. Check your connection and server settings.",
         );
         setConnectionState("FAILED");
       };
 
       ws.onclose = () => {
-        console.info("[Signaling] WebSocket closed.");
+        if (attempt !== attemptRef.current) return;
+        disconnect(); setErrorMessage("The signaling connection closed. Reconnect to start a new session.");
       };
     } catch (err: any) {
+      if (attempt !== attemptRef.current) return;
+      disconnect();
       console.error("[WebViewer] Connection failure:", err);
       setErrorMessage(err.message || "Failed to initiate remote session.");
       setConnectionState("FAILED");
     }
   };
 
-  // WebCodecs Decoder fallback
-  const initWebCodecsDecoder = () => {
-    if (!("VideoDecoder" in window)) return;
-    try {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-
-      const decoder = new VideoDecoder({
-        output: (frame) => {
-          const ctx = canvas.getContext("2d");
-          if (ctx) {
-            ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-          }
-          frame.close();
-          frameCountRef.current++;
-        },
-        error: (e) => console.warn("[WebCodecs] Decoder error:", e),
-      });
-
-      decoder.configure({
-        codec: "avc1.42E01E",
-        codedWidth: 1920,
-        codedHeight: 1080,
-        optimizeForLatency: true,
-      });
-
-      decoderRef.current = decoder;
-    } catch (e) {
-      console.warn("WebCodecs init failed:", e);
+  // Decode the host's Annex-B H.264 frames with dimensions and timestamps from its capture pipeline.
+  const handleEncodedVideoChunk = (frame: EncodedFrame) => {
+    if (!('VideoDecoder' in window)) { setErrorMessage('This browser does not support remote video decoding. Use a current Chromium browser.'); return; }
+    if (decoderRef.current && (decoderRef.current.decodeQueueSize > 6 ||
+        canvasRef.current?.width !== frame.width || canvasRef.current?.height !== frame.height)) {
+      decoderRef.current.close(); decoderRef.current = null;
     }
+    if (!decoderRef.current) {
+      if (!frame.isKeyframe) return;
+      const canvas = canvasRef.current; if (!canvas) return;
+      canvas.width = frame.width; canvas.height = frame.height;
+      let codec = 'avc1.42E01E';
+      for (let i = 0; i + 7 < frame.data.length; i++) {
+        const start = frame.data[i] === 0 && frame.data[i + 1] === 0 && frame.data[i + 2] === 1 ? i + 3 :
+          frame.data[i] === 0 && frame.data[i + 1] === 0 && frame.data[i + 2] === 0 && frame.data[i + 3] === 1 ? i + 4 : -1;
+        if (start >= 0 && (frame.data[start] & 31) === 7) {
+          codec = `avc1.${Array.from(frame.data.subarray(start + 1, start + 4)).map(v => v.toString(16).padStart(2, '0')).join('')}`; break;
+        }
+      }
+      const decoder = new VideoDecoder({ output: videoFrame => {
+        canvas.getContext('2d')?.drawImage(videoFrame, 0, 0, canvas.width, canvas.height); videoFrame.close();
+        frameCountRef.current++; setDecodedVideo(true);
+      }, error: error => { setErrorMessage(`Video decoding failed: ${error.message}`); decoderRef.current?.close(); decoderRef.current = null; } });
+      decoder.configure({ codec, codedWidth: frame.width, codedHeight: frame.height, optimizeForLatency: true }); decoderRef.current = decoder;
+    }
+    if (decoderRef.current.state === 'configured') decoderRef.current.decode(new EncodedVideoChunk({ type: frame.isKeyframe ? 'key' : 'delta', timestamp: Math.round(frame.ptsUs), data: frame.data }));
   };
 
-  const handleEncodedVideoChunk = (data: ArrayBuffer | Uint8Array) => {
-    if (!decoderRef.current || decoderRef.current.state !== "configured")
-      return;
-    const uint8 = data instanceof Uint8Array ? data : new Uint8Array(data);
-    const isKeyframe = uint8[4] === 0x65 || uint8[4] === 0x67; // NALU check
-
-    try {
-      decoderRef.current.decode(
-        new EncodedVideoChunk({
-          type: isKeyframe ? "key" : "delta",
-          timestamp: performance.now() * 1000,
-          data: uint8,
-        }),
-      );
-    } catch {}
-  };
+  useEffect(() => {
+    if (autoConnect && /^\d{9}$/.test(initialRemoteId.replace(/\s/g, ''))) void handleConnect();
+  }, []);
 
   // Real-time WebRTC telemetry poller
   const startTelemetryMonitoring = (pc: RTCPeerConnection) => {
@@ -698,14 +713,14 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
         stats.forEach((report) => {
           if (
             report.type === "candidate-pair" &&
-            report.state === "succeeded"
+            report.state === "succeeded" && report.nominated
           ) {
             rtt = Math.round((report.currentRoundTripTime || 0) * 1000);
             const remoteReport = stats.get(report.remoteCandidateId);
             if (
               remoteReport &&
               (remoteReport.candidateType === "relay" ||
-                report.localCandidateId?.includes("relay"))
+                stats.get(report.localCandidateId)?.candidateType === "relay")
             ) {
               routeType = "TURN_RELAY";
             }
@@ -716,14 +731,14 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
         const now = performance.now();
         const delta = (now - lastFpsTimestampRef.current) / 1000;
         const currentFps =
-          delta > 0 ? Math.round(frameCountRef.current / delta) : 30;
+          delta > 0 ? Math.round(frameCountRef.current / delta) : 0;
         frameCountRef.current = 0;
         lastFpsTimestampRef.current = now;
 
         setTelemetry((prev) => ({
           ...prev,
           rttMs: rtt > 0 ? rtt : prev.rttMs,
-          fps: currentFps > 0 ? currentFps : 30,
+          fps: currentFps,
           route: routeType,
         }));
       } catch {}
@@ -764,6 +779,17 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
         border: isFullscreen ? "none" : "1px solid rgba(255, 255, 255, 0.08)",
       }}
     >
+      <div style={{ padding: '8px 16px', display: 'flex', gap: 12, alignItems: 'center' }}>
+        <button disabled={!acceptedCaps.fileTransfer || connectionState !== 'CONNECTED'} onClick={() => fileInputRef.current?.click()}>Send file to host</button>
+        <input ref={fileInputRef} type="file" hidden onChange={async event => {
+          const file = event.target.files?.[0]; event.target.value = ''; if (!file || !fileSenderRef.current) return;
+          setFileProgress('Preparing file?');
+          try { await fileSenderRef.current.send(file, progress => setFileProgress(`${file.name}: ${progress}%`)); setFileProgress(`${file.name}: verified and saved on host`); }
+          catch (error) { setFileProgress(String(error)); }
+        }} />
+        <span role="status">{fileProgress}</span>
+        {downloads.map(file => <a key={file.url} href={file.url} download={file.name}>Save {file.name}</a>)}
+      </div>
       {/* ── Top Header / Control Toolbar ── */}
       <div
         style={{
@@ -827,8 +853,8 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
         {connectionState === "CONNECTED" && (
           <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
             <button
-              onClick={() => sendSpecialCombo("CtrlAltDel")}
-              title="Send Ctrl+Alt+Del to remote computer"
+              disabled
+              title="Secure attention is unavailable for attended sessions"
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -847,7 +873,7 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
             </button>
 
             <button
-              onClick={() => sendSpecialCombo("WinKey")}
+              disabled={!acceptedCaps.control} onClick={() => sendSpecialCombo("WinKey")}
               title="Open Start Menu (Win Key)"
               style={{
                 display: "flex",
@@ -866,7 +892,7 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
             </button>
 
             <button
-              onClick={() => sendSpecialCombo("AltTab")}
+              disabled={!acceptedCaps.control} onClick={() => sendSpecialCombo("AltTab")}
               title="Switch Application (Alt+Tab)"
               style={{
                 display: "flex",
@@ -886,7 +912,7 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
             </button>
 
             <button
-              onClick={() => setShowClipboardModal(true)}
+              disabled={!acceptedCaps.clipboard} onClick={() => setShowClipboardModal(true)}
               title="Sync Clipboard"
               style={{
                 display: "flex",
@@ -1181,7 +1207,7 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
                 width: fitMode === "fit" ? "100%" : "auto",
                 height: fitMode === "fit" ? "100%" : "auto",
                 objectFit: fitMode === "fit" ? "contain" : "none",
-                display: "block",
+                display: decodedVideo ? "none" : "block",
               }}
             />
 
@@ -1196,7 +1222,7 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
               onContextMenu={(e) => e.preventDefault()}
               onWheel={handleWheel}
               style={{
-                display: videoRef.current?.srcObject ? "none" : "block",
+                display: decodedVideo || !videoRef.current?.srcObject ? "block" : "none",
                 maxWidth: fitMode === "fit" ? "100%" : "none",
                 maxHeight: fitMode === "fit" ? "100%" : "none",
                 width: fitMode === "fit" ? "100%" : "auto",
@@ -1295,7 +1321,7 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
                 Sync Clipboard
               </h3>
               <button
-                onClick={() => setShowClipboardModal(false)}
+                disabled={!acceptedCaps.clipboard} onClick={() => setShowClipboardModal(false)}
                 style={{
                   background: "none",
                   border: "none",
@@ -1336,7 +1362,7 @@ export const WebRemoteViewer: React.FC<WebRemoteViewerProps> = ({
               }}
             >
               <button
-                onClick={() => setShowClipboardModal(false)}
+                disabled={!acceptedCaps.clipboard} onClick={() => setShowClipboardModal(false)}
                 style={{
                   padding: "8px 14px",
                   borderRadius: "6px",

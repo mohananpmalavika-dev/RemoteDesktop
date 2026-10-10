@@ -355,7 +355,7 @@ export const ActiveSessionMonitor: React.FC = () => {
                     color: "var(--brand)",
                   }}
                 >
-                  {session.metrics.fps} FPS @ {session.metrics.bitrateMbps} Mbps
+                  {session.metrics.fps?.toFixed(1) ?? 'N/A'} FPS @ {session.metrics.bitrateMbps?.toFixed(2) ?? 'N/A'} Mbps
                 </div>
               </div>
 
@@ -373,11 +373,11 @@ export const ActiveSessionMonitor: React.FC = () => {
                   style={{
                     fontSize: "14px",
                     fontWeight: 600,
-                    color: session.metrics.rttMs < 30 ? "#218768" : "#f59e0b",
+                    color: session.metrics.rttMs !== null && session.metrics.rttMs < 30 ? "#218768" : "#f59e0b",
                   }}
                 >
-                  {session.metrics.rttMs} ms (Loss:{" "}
-                  {session.metrics.packetLossPercent}%)
+                  {session.metrics.rttMs?.toFixed(0) ?? 'N/A'} ms (Loss:{" "}
+                  {session.metrics.packetLossPercent?.toFixed(1) ?? 'N/A'}%)
                 </div>
               </div>
 

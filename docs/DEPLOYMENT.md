@@ -1,67 +1,36 @@
-# KryptonRemote Enterprise Deployment Guide
+# Production deployment
 
-## 1. Overview
+Use this runbook with `infra/docker-compose.prod.yml`. Older GCP/runbook examples are historical and must not be used as production credentials or readiness evidence.
 
-KryptonRemote is deployed using Docker Compose for on-premises/edge deployments or Kubernetes for scalable cloud environments.
+## Configuration
 
----
+Copy `infra/.env.production.example` to an untracked environment file inside `infra`. Supply a DNS domain pointing to the server, the externally reachable TURN IP, and separate random hexadecimal secrets. Hex passwords avoid URL-encoding ambiguity in database/Redis URLs. Generate each with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`. Do not reuse secrets or commit the environment file.
 
-## 2. Infrastructure Components
+Open TCP 80/443, TCP+UDP 3478, and UDP 49152?49250. Production Compose keeps PostgreSQL, Redis, API and signaling ports private. HTTPS/WSS share one domain through Caddy. TURN uses UDP/TCP on 3478; TURN TLS is not configured by this template. If UDP and direct TCP TURN are blocked on a client network, add a separately configured TLS TURN listener/certificate and advertise its URL.
 
-1. **API Gateway & Control Plane (`services/api`):**
-   - Port: `4000`
-   - Framework: NestJS 10 / Node.js 20+
-   - Dependencies: PostgreSQL 16+, Redis 7+
-2. **Signaling Cluster (`services/signaling`):**
-   - Port: `4001` (WebSocket)
-   - Real-time ICE exchange and session orchestration
-   - Dependencies: Redis PubSub (session routing)
-3. **Admin Web Portal (`apps/admin-web`):**
-   - Port: `3000`
-   - Static asset hosting / SPA via Nginx
-4. **TURN / STUN Media Relay (`infra/coturn`):**
-   - Ports: `3478` UDP/TCP (STUN/TURN), `5349` UDP/TCP (TURNS / TLS), `49152-65535` UDP (Relay allocations)
-   - coturn 4.6+
+`TRUST_PROXY=true` assumes exactly one trusted proxy and private API/signaling ports. Disable it when exposing the services directly. CORS defaults to the API origin; list any additional HTTPS browser origins explicitly.
 
----
+## Fresh installation
 
-## 3. Docker Compose Orchestration
+From the repository root:
 
-Use the pre-configured `infra/docker-compose.yml`:
-
-```bash
-# 1. Configure environment variables
-cp .env.example .env
-
-# 2. Start PostgreSQL, Redis, and Coturn
-docker compose up -d postgres redis coturn
-
-# 3. Run database migrations
-npx prisma migrate deploy
-
-# 4. Start Control Plane and Signaling Services
-docker compose up -d api signaling admin-web
+```powershell
+docker compose --env-file infra/.env.production -f infra/docker-compose.prod.yml config --quiet
+docker compose --env-file infra/.env.production -f infra/docker-compose.prod.yml build
+docker compose --env-file infra/.env.production -f infra/docker-compose.prod.yml up -d
+docker compose --env-file infra/.env.production -f infra/docker-compose.prod.yml ps
 ```
 
----
+The `migrate` container runs `prisma migrate deploy` before API/signaling start. API and signaling readiness check their database/cache dependencies. Open the HTTPS site, create the first organization, sign in, generate an enrollment token, and register the Windows host with `https://your-domain/api/v1`. The single-use token is required; hosts initially remain offline until signed heartbeats arrive.
 
-## 4. Environment Variables Checklist
+## Existing installations
 
-| Variable | Description | Example / Default |
-| :--- | :--- | :--- |
-| `DATABASE_URL` | PostgreSQL connection string | `postgresql://krypton:secret@postgres:5432/krypton_db?schema=public` |
-| `REDIS_URL` | Redis connection URL | `redis://redis:6379` |
-| `JWT_ACCESS_SECRET` | Secret for user access tokens | `256-bit cryptographically secure string` |
-| `JWT_REFRESH_SECRET` | Secret for refresh token families | `256-bit cryptographically secure string` |
-| `COTURN_SECRET` | Shared secret for ephemeral TURN credentials | `alphanumeric secure secret` |
-| `TURN_SERVER_URL` | Publicly reachable TURN host | `turn:turn.kryptonlogic.com:3478` |
-| `NODE_ENV` | Runtime environment | `production` |
+Back up PostgreSQL and restore it to a disposable instance first. Compare that database with the original initial schema (`20261010000000_initial`). If an existing database was created using `prisma db push` and exactly matches that schema, baseline only the initial migration with `prisma migrate resolve --applied 20261010000000_initial`. Then apply `20261010000001_hardening` using `prisma migrate deploy`. Do not mark the hardening migration as applied before its columns exist. Reconcile any drift before production rollout.
 
----
+The hardening migration adds organization policy and refresh-token MFA state. Existing tokens lack the new access scope/family claims and users must log in again. Recording-required legacy policies block new sessions until recording is disabled. Existing revoked devices remain revoked; re-enrollment cannot bypass revocation.
 
-## 5. Kubernetes Helm / Manifest Architecture
+## Release and operation
 
-In production Kubernetes clusters:
-- API instances run behind an Ingress Controller (with TLS termination).
-- Signaling instances use sticky sessions or Redis PubSub horizontal scaling.
-- Coturn runs in `hostNetwork: true` mode on dedicated edge nodes to minimize NAT traversal latency.
+Run CI and the two-machine acceptance tests listed in `../PRODUCTION_READINESS.md` before publishing. Use immutable image tags/digests for releases. Keep the preceding image for application rollback; do not automatically reverse schema migrations. Schedule encrypted database backups, restore drills and secret rotation. Monitor readiness, login failures, signaling disconnects, Redis memory, PostgreSQL storage, host availability and TURN allocation/resource limits. Establish retention for guest identities, ended sessions and audit records before a public rollout.
+
+Build Windows installers only after native compilation and two-machine acceptance. Configure the publisher signing certificate and verify signed installers on a clean Windows machine. No signing key or deployment credentials are supplied by this repository.

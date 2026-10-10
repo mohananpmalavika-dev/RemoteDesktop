@@ -6,6 +6,8 @@ import { APP_GUARD } from '@nestjs/core';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { RbacService } from '../rbac/rbac.service';
+import { RedisService } from '../redis/redis.service';
+import { RateLimitGuard } from './rate-limit.guard';
 
 @Module({
   controllers: [AuthController],
@@ -14,6 +16,8 @@ import { RbacService } from '../rbac/rbac.service';
     PrismaService,
     AuditService,
     RbacService,
+    RedisService,
+    { provide: APP_GUARD, useClass: RateLimitGuard },
     {
       provide: APP_GUARD,
       useClass: AuthGuard,

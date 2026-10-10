@@ -11,6 +11,9 @@ import { RbacService } from '../rbac/rbac.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { Public } from './public.decorator';
 import { CurrentUser } from './current-user.decorator';
+import { parseBody } from '../common/validation';
+import { z } from 'zod';
+import crypto from 'crypto';
 
 @Controller('auth')
 export class AuthController {
@@ -26,7 +29,10 @@ export class AuthController {
   @Public()
   @Post('register')
   async register(@Body() body: any) {
-    const { organizationName, email, username, password } = body;
+    const { organizationName, email, username, password } = parseBody(z.object({
+      organizationName: z.string().trim().min(1).max(128), email: z.string().trim().email().max(254).transform(v => v.toLowerCase()),
+      username: z.string().trim().min(3).max(64).regex(/^[a-zA-Z0-9_.-]+$/), password: z.string().min(12).max(128),
+    }).strict(), body);
 
     if (!organizationName || !email || !username || !password) {
       throw new BadRequestException('organizationName, email, username, and password are required.');
@@ -44,32 +50,16 @@ export class AuthController {
       throw new BadRequestException('User with this email or username already exists.');
     }
 
-    const org = await this.prisma.organization.create({
-      data: {
-        name: organizationName,
-        slug: organizationName.toLowerCase().replace(/[^a-z0-9]/g, '-') + '-' + Math.floor(Math.random() * 10000),
-      },
-    });
-
     const passwordHash = await this.authService.hashPassword(password);
-
-    const user = await this.prisma.user.create({
-      data: {
-        organizationId: org.id,
-        email,
-        username,
-        passwordHash,
-      },
-    });
-
-    // Seed default roles and grant System Administrator to the first user
-    const adminRole = await this.rbacService.seedDefaultRolesAndPermissions(org.id);
-    await this.prisma.userRole.create({
-      data: {
-        userId: user.id,
-        roleId: adminRole.id,
-      },
-    });
+    const { org, user } = await this.prisma.$transaction(async tx => {
+      const org = await tx.organization.create({ data: {
+        name: organizationName, slug: organizationName.toLowerCase().replace(/[^a-z0-9]/g, '-') + '-' + crypto.randomUUID(),
+      } });
+      const user = await tx.user.create({ data: { organizationId: org.id, email, username, passwordHash } });
+      const adminRole = await this.rbacService.seedDefaultRolesAndPermissions(org.id, tx);
+      await tx.userRole.create({ data: { userId: user.id, roleId: adminRole.id } });
+      return { org, user };
+    }, { timeout: 15000 });
 
     return {
       message: 'Organization and user registered successfully.',
@@ -81,7 +71,7 @@ export class AuthController {
   @Public()
   @Post('login')
   async login(@Body() body: any, @Req() req: any) {
-    const { username, email, password } = body;
+    const { username, email, password } = parseBody(z.object({ username: z.string().min(1).max(254).optional(), email: z.string().email().max(254).optional(), password: z.string().min(1).max(128) }).strict(), body);
     const identifier = username || email;
     if (!identifier || !password) {
       throw new BadRequestException('Identifier and password are required.');
@@ -96,7 +86,7 @@ export class AuthController {
   @Public()
   @Post('mfa/verify')
   async verifyMfa(@Body() body: any, @Req() req: any) {
-    const { mfaToken, code } = body;
+    const { mfaToken, code } = parseBody(z.object({ mfaToken: z.string().min(10).max(4096), code: z.string().regex(/^\d{6}$/) }).strict(), body);
     if (!mfaToken || !code) {
       throw new BadRequestException('mfaToken and code are required.');
     }
@@ -110,7 +100,7 @@ export class AuthController {
   @Public()
   @Post('refresh')
   async refresh(@Body() body: any, @Req() req: any) {
-    const { refreshToken } = body;
+    const { refreshToken } = parseBody(z.object({ refreshToken: z.string().min(20).max(200) }).strict(), body);
     if (!refreshToken) {
       throw new BadRequestException('refreshToken is required.');
     }
@@ -123,7 +113,7 @@ export class AuthController {
 
   @Post('logout')
   async logout(@Body() body: any) {
-    const { refreshToken } = body;
+    const { refreshToken } = parseBody(z.object({ refreshToken: z.string().min(20).max(200) }).strict(), body);
     if (refreshToken) {
       await this.authService.logout(refreshToken);
     }
@@ -137,7 +127,7 @@ export class AuthController {
 
   @Post('mfa/activate')
   async activateMfa(@CurrentUser() user: any, @Body() body: any) {
-    const { secret, code } = body;
+    const { secret, code } = parseBody(z.object({ secret: z.string().min(10).max(128), code: z.string().regex(/^\d{6}$/) }).strict(), body);
     if (!secret || !code) {
       throw new BadRequestException('secret and code are required.');
     }

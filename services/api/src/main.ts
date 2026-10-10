@@ -15,7 +15,10 @@ async function bootstrap() {
 
   const app = await NestFactory.create(AppModule, {
     logger: ['error', 'warn', 'log'],
+    rawBody: true,
   });
+  app.enableShutdownHooks();
+  if (config.TRUST_PROXY) app.getHttpAdapter().getInstance().set('trust proxy', 1);
 
   // Global error filter adhering to Section 38 standardized format
   app.useGlobalFilters(new KryptonExceptionFilter());
@@ -35,7 +38,7 @@ async function bootstrap() {
   // Strict CORS in production (Section 41)
   if (config.NODE_ENV === 'production') {
     app.enableCors({
-      origin: [config.API_PUBLIC_URL],
+      origin: config.CORS_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean).concat(new URL(config.API_PUBLIC_URL).origin),
       credentials: true,
     });
   } else {

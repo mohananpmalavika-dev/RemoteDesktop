@@ -2,21 +2,40 @@
  * Enterprise Admin API Client for KryptonRemote Control Plane
  */
 
-const API_BASE = import.meta.env.VITE_API_URL || '/api/v1';
+export const API_BASE = import.meta.env.VITE_API_URL || '/api/v1';
 
 export function getAuthToken(): string | null {
   return localStorage.getItem('krypton_admin_token') || sessionStorage.getItem('krypton_admin_token');
 }
 
-export function setAuthToken(token: string, persist = true) {
-  if (persist) {
-    localStorage.setItem('krypton_admin_token', token);
-  } else {
-    sessionStorage.setItem('krypton_admin_token', token);
-  }
+export function setAuthToken(token: string, persist = false) {
+  localStorage.removeItem('krypton_admin_token'); sessionStorage.removeItem('krypton_admin_token');
+  (persist ? localStorage : sessionStorage).setItem('krypton_admin_token', token);
+}
+export function clearAuth() {
+  for (const storage of [localStorage, sessionStorage]) { storage.removeItem('krypton_admin_token'); storage.removeItem('krypton_refresh_token'); }
+  window.dispatchEvent(new Event('krypton:auth-changed'));
+}
+export function saveTokens(tokens: { accessToken: string; refreshToken: string }, persist = false) {
+  for (const storage of [localStorage, sessionStorage]) { storage.removeItem('krypton_admin_token'); storage.removeItem('krypton_refresh_token'); }
+  setAuthToken(tokens.accessToken, persist);
+  (persist ? localStorage : sessionStorage).setItem('krypton_refresh_token', tokens.refreshToken);
+}
+let refreshing: Promise<boolean> | null = null;
+async function refreshAccess(): Promise<boolean> {
+  if (refreshing) return refreshing;
+  refreshing = (async () => {
+    const persist = !!localStorage.getItem('krypton_refresh_token');
+    const token = localStorage.getItem('krypton_refresh_token') || sessionStorage.getItem('krypton_refresh_token');
+    if (!token) return false;
+    const response = await fetch(`${API_BASE}/auth/refresh`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ refreshToken: token }) });
+    if (!response.ok) return false;
+    saveTokens(await response.json(), persist); return true;
+  })().catch(() => false);
+  try { return await refreshing; } finally { refreshing = null; }
 }
 
-async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+export async function apiRequest<T>(endpoint: string, options: RequestInit = {}, retried = false): Promise<T> {
   const token = getAuthToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -34,6 +53,10 @@ async function apiRequest<T>(endpoint: string, options: RequestInit = {}): Promi
     headers,
   });
 
+  if (response.status === 401 && !endpoint.startsWith('/auth/') && !retried) {
+    if (await refreshAccess()) return apiRequest<T>(endpoint, options, true);
+    clearAuth();
+  }
   if (!response.ok) {
     let errorBody: any;
     try {
@@ -65,10 +88,10 @@ export interface ActiveSessionDto {
     fileTransfer: boolean;
   };
   metrics: {
-    fps: number;
-    bitrateMbps: number;
-    rttMs: number;
-    packetLossPercent: number;
+    fps: number | null;
+    bitrateMbps: number | null;
+    rttMs: number | null;
+    packetLossPercent: number | null;
   };
 }
 
@@ -103,10 +126,10 @@ export interface DeviceRecordDto {
   osVersion: string;
   architecture: string;
   agentVersion: string;
-  status: 'ONLINE' | 'DEGRADED' | 'OFFLINE';
+  status: 'ONLINE' | 'DEGRADED' | 'OFFLINE' | 'REVOKED';
   lastHeartbeat: string;
-  cpuPercent: number;
-  memoryPercent: number;
+  cpuPercent: number | null;
+  memoryPercent: number | null;
   sessionCount: number;
   policyName: string;
 }
@@ -120,7 +143,18 @@ export interface TenantPolicyDto {
   sessionRecording: boolean;
 }
 
+export interface CurrentUser { id: string; email: string; username: string; mfaEnabled: boolean; organization: { id: string; name: string }; permissions: string[] }
 export const adminApi = {
+  login: (identifier: string, password: string) => apiRequest<any>('/auth/login', { method: 'POST', body: JSON.stringify({ username: identifier, password }) }),
+  verifyMfa: (mfaToken: string, code: string) => apiRequest<any>('/auth/mfa/verify', { method: 'POST', body: JSON.stringify({ mfaToken, code }) }),
+  register: (body: object) => apiRequest<any>('/auth/register', { method: 'POST', body: JSON.stringify(body) }),
+  me: () => apiRequest<CurrentUser>('/auth/me'),
+  setupMfa: () => apiRequest<{ secret: string; otpAuthUrl: string }>('/auth/mfa/setup', { method: 'POST', body: '{}' }),
+  activateMfa: (secret: string, code: string) => apiRequest<any>('/auth/mfa/activate', { method: 'POST', body: JSON.stringify({ secret, code }) }),
+  logout: async () => {
+    const refreshToken = localStorage.getItem('krypton_refresh_token') || sessionStorage.getItem('krypton_refresh_token');
+    try { if (refreshToken) await apiRequest('/auth/logout', { method: 'POST', body: JSON.stringify({ refreshToken }) }); } finally { clearAuth(); }
+  },
   // Health
   checkHealth: async () => {
     return apiRequest<{ status: string; dependencies?: Record<string, string> }>('/health/ready');
@@ -174,8 +208,8 @@ export const adminApi = {
     return apiRequest<TenantPolicyDto>('/policies');
   },
 
-  updatePolicies: async (policies: Partial<TenantPolicyDto>): Promise<{ success: boolean; policies: TenantPolicyDto }> => {
-    return apiRequest<{ success: boolean; policies: TenantPolicyDto }>('/policies', {
+  updatePolicies: async (policies: Partial<TenantPolicyDto>): Promise<TenantPolicyDto> => {
+    return apiRequest<TenantPolicyDto>('/policies', {
       method: 'PUT',
       body: JSON.stringify(policies),
     });

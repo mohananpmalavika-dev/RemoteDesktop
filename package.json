@@ -11,6 +11,7 @@
   "scripts": {
     "build": "npm run build --workspaces --if-present",
     "test": "vitest run",
+    "test:integration": "node scripts/integration-test.mjs",
     "test:native": "cargo test --package device-identity --package krypton-input --package krypton-file-transfer --package krypton-remote-core --package krypton-transport",
     "test:all": "npm run test && npm run test:native",
     "typecheck": "npm run typecheck --workspaces --if-present",
@@ -23,12 +24,16 @@
     "prisma:migrate": "prisma migrate dev --schema=prisma/schema.prisma",
     "prisma:studio": "prisma studio --schema=prisma/schema.prisma"
   },
+  "engines": { "node": ">=22.18.0" },
   "devDependencies": {
     "@types/node": "^22.13.0",
     "dotenv": "^16.4.7",
     "prisma": "^6.3.1",
     "typescript": "^5.7.3",
-    "vitest": "^3.0.5",
+    "vitest": "^5.0.3",
     "zod": "^3.24.1"
+  },
+  "overrides": {
+    "@prisma/config": { "deepmerge-ts": "^8.0.0" }
   }
 }

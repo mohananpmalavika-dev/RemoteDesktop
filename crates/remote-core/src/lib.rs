@@ -9,7 +9,7 @@ pub use krypton_transport::*;
 
 use serde::{Deserialize, Serialize};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     mpsc::{self, Receiver, SyncSender},
     Arc,
 };
@@ -153,13 +153,16 @@ impl RemoteEngine {
             os_version: sys_info.os_version,
             architecture: sys_info.arch,
             session_count: if self.state == EngineState::SessionActive { 1 } else { 0 },
-            cpu_percent: 1.5,
-            memory_percent: 12.0,
+            cpu_percent: get_live_system_telemetry().cpu_load_pct,
+            memory_percent: get_live_system_telemetry().ram_usage_pct as f32,
             uptime_seconds: self.start_time.elapsed().as_secs(),
         })
     }
 
     pub fn state(&self) -> EngineState { self.state }
+    pub fn sign_device_payload(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        self.identity_manager.as_ref().map(|manager| manager.sign(payload)).ok_or_else(|| "Device identity is unavailable".into())
+    }
     pub fn remote_id(&self) -> Option<&str> { self.remote_id.as_deref() }
 
     pub fn start_transport_session(&mut self, ice_servers: Vec<IceServerConfig>) -> &mut WebRtcPeerConnection {
@@ -347,6 +350,7 @@ pub fn process_incoming_file_transfer(
 /// Encoded packets are sent over an mpsc channel for consumption by the viewer.
 pub struct CaptureSession {
     shutdown: Arc<AtomicBool>,
+    bitrate: Arc<AtomicU32>,
     thread: Option<thread::JoinHandle<()>>,
     pub receiver: Receiver<EncodedPacket>,
     display_id: usize,
@@ -361,18 +365,35 @@ impl CaptureSession {
         target_fps: u32,
         bitrate_kbps: u32,
     ) -> Result<Self, String> {
+        if !(1..=60).contains(&target_fps) || !(200..=20000).contains(&bitrate_kbps) {
+            return Err("Capture frame rate or bitrate is out of range".into());
+        }
         let (tx, rx) = mpsc::sync_channel::<EncodedPacket>(4); // 4-frame backpressure buffer
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
+        let bitrate = Arc::new(AtomicU32::new(bitrate_kbps));
+        let bitrate_clone = Arc::clone(&bitrate);
 
         let thread = thread::Builder::new()
             .name(format!("krypton-capture-{display_id}"))
             .spawn(move || {
-                if let Err(e) = capture_loop(display_id, target_fps, bitrate_kbps, tx, shutdown_clone) {
+                if let Err(e) = capture_loop(display_id, target_fps, bitrate_kbps, tx, Arc::clone(&shutdown_clone), bitrate_clone, &ready_tx) {
+                    let _ = ready_tx.try_send(Err(e.clone()));
                     log::error!("[capture-session] Capture loop error: {e}");
                 }
+                shutdown_clone.store(true, Ordering::Release);
             })
             .map_err(|e| format!("Failed to spawn capture thread: {e}"))?;
+
+        match ready_rx.recv_timeout(Duration::from_secs(15)) {
+            Ok(Ok(())) => {},
+            result => {
+                shutdown.store(true, Ordering::Release);
+                let _ = thread.join();
+                return Err(match result { Ok(Err(error)) => error, _ => "Capture initialization timed out".into() });
+            }
+        }
 
         log::info!(
             "[capture-session] Started display={} fps={} bitrate={}kbps",
@@ -381,6 +402,7 @@ impl CaptureSession {
 
         Ok(CaptureSession {
             shutdown,
+            bitrate,
             thread: Some(thread),
             receiver: rx,
             display_id,
@@ -399,6 +421,11 @@ impl CaptureSession {
 
     pub fn display_id(&self) -> usize { self.display_id }
     pub fn target_fps(&self) -> u32 { self.target_fps }
+    pub fn update_bitrate(&self, bitrate_kbps: u32) -> Result<(), String> {
+        if !(200..=20000).contains(&bitrate_kbps) || !self.is_running() { return Err("No active capture or invalid bitrate".into()); }
+        self.bitrate.store(bitrate_kbps, Ordering::Release);
+        Ok(())
+    }
     pub fn is_running(&self) -> bool {
         !self.shutdown.load(Ordering::Acquire)
     }
@@ -417,6 +444,8 @@ fn capture_loop(
     bitrate_kbps: u32,
     tx: SyncSender<EncodedPacket>,
     shutdown: Arc<AtomicBool>,
+    bitrate: Arc<AtomicU32>,
+    ready: &SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
     let mut capturer = krypton_capture::create_best_capturer();
     capturer
@@ -446,6 +475,10 @@ fn capture_loop(
     encoder
         .initialize(&encoder_config)
         .map_err(|e| format!("encoder init: {e}"))?;
+    let _ = ready.send(Ok(()));
+    let mut active_bitrate = bitrate_kbps;
+    let mut last_raw_frame = None;
+    let mut last_encoded = std::time::Instant::now();
 
     let frame_interval = Duration::from_micros(1_000_000 / target_fps as u64);
     let mut last_frame = std::time::Instant::now();
@@ -462,12 +495,32 @@ fn capture_loop(
         }
         last_frame = std::time::Instant::now();
 
-        match capturer.capture_frame() {
-            Ok(Some(frame)) => {
-                match encoder.encode_frame(&frame) {
+        let desired_bitrate = bitrate.load(Ordering::Acquire);
+        if desired_bitrate != active_bitrate {
+            encoder.update_bitrate(desired_bitrate).map_err(|error| format!("bitrate update: {error}"))?;
+            active_bitrate = desired_bitrate;
+        }
+        let captured = match capturer.capture_frame() {
+            Ok(Some(frame)) => { last_raw_frame = Some(frame); true },
+            Ok(None) if last_encoded.elapsed() >= Duration::from_secs(2) && last_raw_frame.is_some() => {
+                // Resend a keyframe on idle screens so a newly opened channel can decode.
+                encoder.request_keyframe(); true
+            },
+            result => { if let Err(e) = result {
+                log::warn!("[capture-loop] Capture error: {e}");
+                thread::sleep(Duration::from_millis(500));
+                capturer.start_capture(display_id).map_err(|e| format!("capture re-init: {e}"))?;
+            } false },
+        };
+        if captured {
+            if let Some(frame) = last_raw_frame.as_mut() {
+                if last_encoded.elapsed() >= Duration::from_secs(2) { frame.timestamp_ns = frame.timestamp_ns.saturating_add(2_000_000_000); }
+                last_encoded = std::time::Instant::now();
+                match encoder.encode_frame(frame) {
                     Ok(Some(pkt)) => {
                         // Non-blocking send; drop frames if consumer is slow
                         if tx.try_send(pkt).is_err() {
+                            encoder.request_keyframe();
                             log::debug!("[capture-loop] Receiver buffer full, dropping frame");
                         }
                     }
@@ -475,16 +528,6 @@ fn capture_loop(
                     Err(e) => {
                         log::warn!("[capture-loop] Encode error: {e}");
                     }
-                }
-            }
-            Ok(None) => {} // No new frame (DXGI timeout)
-            Err(e) => {
-                log::warn!("[capture-loop] Capture error: {e}");
-                // On access lost, try to re-init capture after brief pause
-                thread::sleep(Duration::from_millis(500));
-                if let Err(reinit_err) = capturer.start_capture(display_id) {
-                    log::error!("[capture-loop] Re-init failed: {reinit_err}");
-                    break;
                 }
             }
         }
@@ -744,6 +787,10 @@ impl FileTransferManager {
             return Err(FileTransferError::PermissionDenied);
         }
 
+        self.receivers.retain(|_, receiver| matches!(receiver.state(), TransferState::Transferring | TransferState::Paused));
+        if self.receivers.len() >= 4 || self.receivers.contains_key(&metadata.transfer_id) {
+            return Err(FileTransferError::InvalidMetadata);
+        }
         let receiver = FileTransferReceiver::new(metadata.clone(), &self.staging_dir)?;
         self.receivers.insert(metadata.transfer_id, receiver);
         Ok(())
@@ -804,6 +851,11 @@ impl FileTransferManager {
             found = true;
         }
         found
+    }
+
+    pub fn cancel_all(&mut self) {
+        for receiver in self.receivers.values_mut() { receiver.cancel(); }
+        self.receivers.clear(); self.senders.clear();
     }
 }
 

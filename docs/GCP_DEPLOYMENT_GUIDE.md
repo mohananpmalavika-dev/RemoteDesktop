@@ -1,3 +1,5 @@
+> Historical deployment notes. Do not execute these commands or reuse the example credentials. Use [DEPLOYMENT.md](DEPLOYMENT.md) for the current migration, secrets, networking and TLS workflow.
+
 # KryptonRemote — GCP Isolated VM Deployment Guide
 
 **Target GCP Project:** `project-7866fc3f-5dd5-4495-804`  

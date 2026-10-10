@@ -5,6 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { RedisService } from '../redis/redis.service';
 import { AuditService } from '../audit/audit.service';
 import { RbacService } from '../rbac/rbac.service';
+import { DeviceAuthGuard } from '../auth/device-auth.guard';
 
 @Module({
   controllers: [DevicesController],
@@ -14,6 +15,7 @@ import { RbacService } from '../rbac/rbac.service';
     RedisService,
     AuditService,
     RbacService,
+    DeviceAuthGuard,
   ],
   exports: [DevicesService],
 })

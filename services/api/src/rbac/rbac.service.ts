@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { KryptonPermission, SystemRole } from '@krypton/shared-types';
+import { Prisma } from '@prisma/client';
 
 @Injectable()
 export class RbacService {
@@ -36,12 +37,12 @@ export class RbacService {
   /**
    * Seed standard system permissions and roles if not present
    */
-  async seedDefaultRolesAndPermissions(organizationId: string) {
+  async seedDefaultRolesAndPermissions(organizationId: string, database: Prisma.TransactionClient = this.prisma) {
     const allPermissions = Object.values(KryptonPermission);
 
     // Upsert permissions
     for (const perm of allPermissions) {
-      await this.prisma.permission.upsert({
+      await database.permission.upsert({
         where: { name: perm },
         update: {},
         create: {
@@ -53,7 +54,7 @@ export class RbacService {
     }
 
     // Upsert System Administrator role with all permissions
-    const adminRole = await this.prisma.role.upsert({
+    const adminRole = await database.role.upsert({
       where: {
         organizationId_name: {
           organizationId,
@@ -69,9 +70,9 @@ export class RbacService {
       },
     });
 
-    const perms = await this.prisma.permission.findMany();
+    const perms = await database.permission.findMany();
     for (const p of perms) {
-      await this.prisma.rolePermission.upsert({
+      await database.rolePermission.upsert({
         where: {
           roleId_permissionId: {
             roleId: adminRole.id,

@@ -1,9 +1,13 @@
 import http from 'http';
+import { isIP } from 'net';
 import { WebSocketServer, WebSocket } from 'ws';
 import Redis from 'ioredis';
 import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
+import { PrismaClient } from '@prisma/client';
+import { AccessClaimsSchema, GuestClaimsSchema } from '@krypton/protocol';
+import { authorizeSessionMessage } from './authorization';
 import { getConfig } from '@krypton/config';
 import { createLogger } from '@krypton/logger';
 import {
@@ -15,6 +19,8 @@ import {
 
 const logger = createLogger({ serviceName: 'krypton-signaling' });
 const config = getConfig();
+const prisma = new PrismaClient();
+const socketClaims = new Map<WebSocket, any>();
 
 // Authoritative authenticated connection context map
 const socketContexts = new Map<WebSocket, AuthenticatedSocketContext>();
@@ -46,7 +52,7 @@ function checkRateLimit(ip: string): boolean {
 }
 
 // HTTP Server for Health & Readiness Checks
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   if (req.url === '/health/live') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'UP', timestamp: new Date().toISOString() }));
@@ -57,7 +63,8 @@ const server = http.createServer((req, res) => {
     const isRedisPubReady = pubClient.status === 'ready';
     const isRedisSubReady = subClient.status === 'ready';
 
-    if (isRedisPubReady && isRedisSubReady) {
+    const isDatabaseReady = await prisma.$queryRaw`SELECT 1`.then(() => true).catch(() => false);
+    if (isRedisPubReady && isRedisSubReady && isDatabaseReady) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'UP',
@@ -68,7 +75,7 @@ const server = http.createServer((req, res) => {
       res.writeHead(503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'DOWN',
-        error: 'Redis connection unavailable for signaling plane',
+        error: 'A signaling dependency is unavailable',
       }));
     }
     return;
@@ -154,7 +161,8 @@ function verifyDeviceEd25519Signature(
 }
 
 wss.on('connection', (ws: WebSocket, req) => {
-  const ip = req.socket.remoteAddress || 'unknown';
+  const forwarded = typeof req.headers['x-forwarded-for'] === 'string' ? req.headers['x-forwarded-for'].split(',').at(-1)?.trim() : undefined;
+  const ip = config.TRUST_PROXY && forwarded && isIP(forwarded) ? forwarded : req.socket.remoteAddress || 'unknown';
   const socketId = uuidv4();
 
   if (!checkRateLimit(ip)) {
@@ -187,7 +195,12 @@ wss.on('connection', (ws: WebSocket, req) => {
     }
   }, 15000);
 
-  ws.on('message', async (data: Buffer) => {
+  let processing = Promise.resolve();
+  let queued = 0;
+  ws.on('message', (data: Buffer) => {
+    if (++queued > 32) { ws.close(4008, 'Too many pending messages'); return; }
+    processing = processing.then(async () => {
+    if (ws.readyState !== WebSocket.OPEN) return;
     try {
       if (!checkRateLimit(ip)) {
         ws.send(JSON.stringify({
@@ -235,7 +248,7 @@ wss.on('connection', (ws: WebSocket, req) => {
       // Handle Authentication Submit (Section 2)
       if (msg.type === SignalingMessageType.AUTH_SUBMIT) {
         const challenge = pendingChallenges.get(ws);
-        if (!challenge) {
+        if (!challenge || Date.now() - challenge.issuedAt > 15000 || socketContexts.has(ws)) {
           ws.close(4003, 'Challenge expired or missing');
           return;
         }
@@ -245,15 +258,29 @@ wss.on('connection', (ws: WebSocket, req) => {
         if (payload.subjectType === 'USER') {
           // Verify JWT access token
           try {
-            const decoded = jwt.verify(payload.accessToken, config.JWT_ACCESS_SECRET) as any;
+            const decoded = jwt.verify(payload.accessToken, config.JWT_ACCESS_SECRET, { algorithms: ['HS256'] });
+            const access = AccessClaimsSchema.safeParse(decoded);
+            const guest = GuestClaimsSchema.safeParse(decoded);
+            if (!access.success && !guest.success) throw new Error('Invalid token scope');
+            const claims = access.success ? access.data : guest.success ? guest.data : null;
+            if (!claims) throw new Error('Invalid claims');
+            if (access.success) {
+              const user = await prisma.user.findUnique({ where: { id: access.data.userId } });
+              const family = await prisma.refreshToken.findFirst({ where: { userId: access.data.userId, familyId: access.data.familyId, isRevoked: false, expiresAt: { gt: new Date() } } });
+              if (!user || user.status !== 'ACTIVE' || user.organizationId !== claims.organizationId || !family) throw new Error('Revoked identity');
+            } else if (guest.success) {
+              const raw = await pubClient.get(`krypton:session:${guest.data.sessionId}`);
+              if (!raw || JSON.parse(raw).viewerUserId !== claims.sub) throw new Error('Guest session expired');
+            }
+            socketClaims.set(ws, { ...claims, exp: (decoded as any).exp });
             clearTimeout(authTimeout);
             pendingChallenges.delete(ws);
 
             const context: AuthenticatedSocketContext = {
               socketId,
-              tenantId: decoded.organizationId,
+              tenantId: claims.organizationId,
               subjectType: 'USER',
-              subjectId: decoded.sub,
+              subjectId: claims.sub,
               sessionIds: new Set<string>(),
               authenticatedAt: new Date(),
             };
@@ -289,24 +316,9 @@ wss.on('connection', (ws: WebSocket, req) => {
             return;
           }
 
-          // Lookup registered device public key in Redis or database cache
-          const rawKeyInfo = await pubClient.get(`krypton:device:key:${payload.deviceId}`);
-          let publicKeyBase64: string | null = null;
-          let organizationId: string | null = null;
-
-          if (rawKeyInfo) {
-            const keyInfo = JSON.parse(rawKeyInfo);
-            publicKeyBase64 = keyInfo.publicKey;
-            organizationId = keyInfo.organizationId;
-          } else {
-            // Check direct device record in Redis
-            const rawDevice = await pubClient.get(`krypton:device:${payload.deviceId}`);
-            if (rawDevice) {
-              const dev = JSON.parse(rawDevice);
-              publicKeyBase64 = dev.publicKey;
-              organizationId = dev.organizationId;
-            }
-          }
+          const device = await prisma.device.findUnique({ where: { id: payload.deviceId }, include: { deviceKeys: { where: { isActive: true } } } });
+          const publicKeyBase64 = device && device.status !== 'REVOKED' && device.isEnrolled ? device.deviceKeys[0]?.publicKey : null;
+          const organizationId = device?.organizationId;
 
           if (!publicKeyBase64 || !organizationId) {
             logger.warn({ deviceId: payload.deviceId }, 'Device identity or public key not found in fleet directory');
@@ -355,24 +367,8 @@ wss.on('connection', (ws: WebSocket, req) => {
         }
       }
 
-      // Legacy fallback for development/test backwards compatibility
       if (msg.type === SignalingMessageType.REGISTER) {
-        clearTimeout(authTimeout);
-        pendingChallenges.delete(ws);
-        const { entityId, role } = msg.payload;
-
-        const context: AuthenticatedSocketContext = {
-          socketId,
-          tenantId: 'legacy-tenant',
-          subjectType: role === 'HOST_AGENT' ? 'DEVICE' : 'USER',
-          subjectId: entityId,
-          sessionIds: new Set<string>(),
-          authenticatedAt: new Date(),
-        };
-
-        socketContexts.set(ws, context);
-        authenticatedSockets.set(`${context.tenantId}:${context.subjectId}`, ws);
-        logger.info({ entityId, role }, 'Entity registered via legacy protocol');
+        ws.close(4003, 'Legacy unauthenticated registration is disabled');
         return;
       }
 
@@ -393,6 +389,7 @@ wss.on('connection', (ws: WebSocket, req) => {
 
       // Session Authorization & Routing (Section 2 & 26)
       if (
+        msg.type === SignalingMessageType.SESSION_REQUEST ||
         msg.type === SignalingMessageType.OFFER ||
         msg.type === SignalingMessageType.ANSWER ||
         msg.type === SignalingMessageType.ICE_CANDIDATE ||
@@ -418,20 +415,28 @@ wss.on('connection', (ws: WebSocket, req) => {
 
         const session = JSON.parse(rawSession);
 
-        // 1. Strict Tenant Isolation
-        if (session.organizationId && session.organizationId !== authContext.tenantId && authContext.tenantId !== 'legacy-tenant') {
-          logger.warn({ sessionId, tenant: authContext.tenantId, sessionTenant: session.organizationId }, 'Cross-tenant signaling attempt blocked');
-          ws.close(4003, 'Cross-Tenant Violation');
-          return;
+        const claims = socketClaims.get(ws);
+        if (claims?.exp && claims.exp * 1000 <= Date.now()) { ws.close(4002, 'Token expired'); return; }
+        if (authContext.subjectType === 'DEVICE') {
+          const device = await prisma.device.findUnique({ where: { id: authContext.subjectId }, include: { deviceKeys: { where: { isActive: true } } } });
+          if (!device || device.status === 'REVOKED' || device.deviceKeys.length === 0) { ws.close(4003, 'Device revoked'); return; }
+        } else if (claims?.tokenUse === 'access') {
+          const user = await prisma.user.findUnique({ where: { id: authContext.subjectId } });
+          const live = await prisma.refreshToken.findFirst({ where: { userId: authContext.subjectId, familyId: claims.familyId, isRevoked: false, expiresAt: { gt: new Date() } } });
+          if (!user || user.status !== 'ACTIVE' || !live) { ws.close(4003, 'Identity revoked'); return; }
         }
-
-        // 2. Strict Subject Membership Check
-        const isViewer = authContext.subjectId === session.viewerUserId;
-        const isDevice = authContext.subjectId === (session.deviceId || session.targetDeviceId);
-
-        if (!isViewer && !isDevice && authContext.tenantId !== 'legacy-tenant') {
-          logger.warn({ sessionId, sender: authContext.subjectId }, 'Unauthorized entity attempted signaling for foreign session');
-          ws.close(4003, 'Session Membership Unauthorized');
+        let side: 'viewer' | 'device';
+        try { side = authorizeSessionMessage(authContext, session, msg.type, claims?.sessionId); }
+        catch { ws.close(4003, 'Session authorization denied'); return; }
+        const isViewer = side === 'viewer';
+        if (msg.type === SignalingMessageType.SESSION_REQUEST) {
+          const existing = await prisma.remoteSession.findUnique({ where: { id: sessionId }, include: { device: { include: { organization: true } }, viewerUser: true } });
+          if (!existing) return;
+          const authoritative = { ...msg, payload: { sessionId, viewerUserId: session.viewerUserId,
+            viewerName: claims?.tokenUse === 'guest-session' ? 'Guest browser viewer (identity unverified)' : existing.viewerUser.email,
+            organizationName: existing.device.organization.name, targetDeviceId: session.deviceId,
+            requestedCapabilities: session.capabilities } };
+          routeMessage(session.organizationId, session.deviceId, authoritative);
           return;
         }
 
@@ -446,7 +451,9 @@ wss.on('connection', (ws: WebSocket, req) => {
       }
     } catch (err) {
       logger.error({ err }, 'Error handling signaling message');
+      ws.close(4003, 'Invalid signaling message');
     }
+    }).finally(() => { queued--; });
   });
 
   ws.on('close', () => {
@@ -454,7 +461,9 @@ wss.on('connection', (ws: WebSocket, req) => {
     pendingChallenges.delete(ws);
     const context = socketContexts.get(ws);
     if (context) {
-      authenticatedSockets.delete(`${context.tenantId}:${context.subjectId}`);
+      const key = `${context.tenantId}:${context.subjectId}`;
+      if (authenticatedSockets.get(key) === ws) authenticatedSockets.delete(key);
+      socketClaims.delete(ws);
       socketContexts.delete(ws);
       logger.info({ subjectId: context.subjectId }, 'Authenticated entity disconnected');
     }
@@ -466,3 +475,17 @@ server.listen(config.SIGNALING_PORT, config.SIGNALING_HOST, () => {
     `Krypton Secure Signaling Service listening on ${config.SIGNALING_PUBLIC_URL} (Health: http://${config.SIGNALING_HOST}:${config.SIGNALING_PORT}/health/ready)`
   );
 });
+
+const sweep = setInterval(() => {
+  for (const [ip, limit] of rateLimits) if (limit.resetAt <= Date.now()) rateLimits.delete(ip);
+  for (const [ws, claims] of socketClaims) if (claims.exp * 1000 <= Date.now()) ws.close(4002, 'Token expired');
+}, 30000);
+sweep.unref();
+async function shutdown() {
+  clearInterval(sweep);
+  for (const ws of wss.clients) ws.terminate();
+  wss.close(); server.close();
+  await Promise.all([pubClient.quit(), subClient.quit(), prisma.$disconnect()]);
+}
+process.once('SIGTERM', () => void shutdown());
+process.once('SIGINT', () => void shutdown());

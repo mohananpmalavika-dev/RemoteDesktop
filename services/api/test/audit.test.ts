@@ -11,11 +11,13 @@ describe('Phase 7: Enterprise Audit Log Mechanics & Gated Endpoint', () => {
         create: vi.fn().mockImplementation(async ({ data }) => ({
           id: 'audit-log-uuid-1',
           ...data,
-          timestamp: new Date(),
+          timestamp: data.timestamp,
         })),
       },
     };
 
+    (mockPrisma as any).$queryRaw = vi.fn().mockResolvedValue([]);
+    (mockPrisma as any).$transaction = vi.fn().mockImplementation((callback: any) => callback(mockPrisma));
     const service = new AuditService(mockPrisma as any);
 
     const sensitiveMetadata = {
@@ -28,6 +30,7 @@ describe('Phase 7: Enterprise Audit Log Mechanics & Gated Endpoint', () => {
       clipboardContent: 'confidential payroll document text',
       clientVersion: '1.0.0',
       os: 'Windows 11',
+      nested: [{ refresh_token: 'nested-credential', configuration: { mfaSecret: 'secret', safe: 'retained' } }],
     };
 
     const record = await service.record({
@@ -56,6 +59,8 @@ describe('Phase 7: Enterprise Audit Log Mechanics & Gated Endpoint', () => {
     // Verify safe non-sensitive attributes were preserved
     expect(createdData.metadata.clientVersion).toBe('1.0.0');
     expect(createdData.metadata.os).toBe('Windows 11');
+    expect(createdData.metadata.nested).toEqual([{ configuration: { safe: 'retained' } }]);
+    expect((mockPrisma as any).$queryRaw).toHaveBeenCalledOnce();
   });
 
   it('Exposes paginated audit log queries bounded to caller organization', async () => {
@@ -80,6 +85,8 @@ describe('Phase 7: Enterprise Audit Log Mechanics & Gated Endpoint', () => {
       },
     };
 
+    (mockPrisma as any).$queryRaw = vi.fn().mockResolvedValue([]);
+    (mockPrisma as any).$transaction = vi.fn().mockImplementation((callback: any) => callback(mockPrisma));
     const service = new AuditService(mockPrisma as any);
     const controller = new AuditController(service);
 
@@ -115,7 +122,7 @@ describe('Phase 7: Enterprise Audit Log Mechanics & Gated Endpoint', () => {
           const item = {
             id: `audit-${logs.length + 1}`,
             ...data,
-            timestamp: new Date(Date.now() + logs.length * 1000),
+            timestamp: data.timestamp,
           };
           logs.push(item);
           return item;
@@ -126,6 +133,8 @@ describe('Phase 7: Enterprise Audit Log Mechanics & Gated Endpoint', () => {
       },
     };
 
+    (mockPrisma as any).$queryRaw = vi.fn().mockResolvedValue([]);
+    (mockPrisma as any).$transaction = vi.fn().mockImplementation((callback: any) => callback(mockPrisma));
     const service = new AuditService(mockPrisma as any);
 
     // Record two chained events
@@ -154,6 +163,9 @@ describe('Phase 7: Enterprise Audit Log Mechanics & Gated Endpoint', () => {
     const verification = await service.verifyChain('org-123');
     expect(verification.valid).toBe(true);
     expect(verification.verifiedCount).toBe(2);
+    event1.sourceIp = 'tampered-address';
+    expect((await service.verifyChain('org-123')).valid).toBe(false);
+    delete event1.sourceIp;
 
     // Now simulate tampering with event 1's payload
     event1.metadata._chain.canonicalPayload = 'tampered-payload';

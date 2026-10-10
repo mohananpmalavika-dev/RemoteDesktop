@@ -3,6 +3,7 @@ import {
   NotFoundException,
   BadRequestException,
   ForbiddenException,
+  UnauthorizedException,
 } from '@nestjs/common';
 import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
@@ -27,6 +28,11 @@ import {
   SessionRejectMessage,
 } from '@krypton/protocol';
 import { createLogger } from '@krypton/logger';
+import { parseBody } from '../common/validation';
+import { z } from 'zod';
+import { tenantPolicySchema } from '../policies/policies.service';
+import { RbacService } from '../rbac/rbac.service';
+import { KryptonPermission } from '@krypton/shared-types';
 
 const logger = createLogger({ serviceName: 'sessions-service' });
 
@@ -46,7 +52,8 @@ export class SessionsService {
     private readonly redis: RedisService,
     private readonly audit: AuditService,
     private readonly devicesService: DevicesService,
-    private readonly iceService: IceCredentialsService
+    private readonly iceService: IceCredentialsService,
+    private readonly rbac: RbacService
   ) {}
 
   /**
@@ -77,63 +84,22 @@ export class SessionsService {
     organizationId: string,
     dto: CreateSessionDto,
     ipAddress?: string,
-    userAgent?: string
+    userAgent?: string,
+    mfaVerified = false,
+    guest = false
   ) {
-    // 1. Locate target device
-    const rawRemoteId = dto.targetRemoteId ? String(dto.targetRemoteId).trim() : undefined;
-    const cleanId = rawRemoteId ? rawRemoteId.replace(/[\s-]+/g, '') : undefined;
-    const formattedId = cleanId && cleanId.length === 9
-      ? `${cleanId.slice(0, 3)} ${cleanId.slice(3, 6)} ${cleanId.slice(6)}`
-      : cleanId;
-
-    let device: any = null;
-
-    if (dto.targetDeviceId) {
-      device = await this.prisma.device.findUnique({
-        where: { id: dto.targetDeviceId },
-        include: {
-          organization: true,
-          devicePolicy: true,
-        },
-      });
-    }
-
-    if (!device && cleanId) {
-      const remoteIdConditions: any[] = [
-        { remoteId: cleanId },
-        { remoteId: formattedId },
-      ];
-      if (rawRemoteId && rawRemoteId !== cleanId && rawRemoteId !== formattedId) {
-        remoteIdConditions.push({ remoteId: rawRemoteId });
-      }
-
-      // Try locating within caller's organization first
-      if (organizationId) {
-        device = await this.prisma.device.findFirst({
-          where: {
-            organizationId,
-            OR: remoteIdConditions,
-          },
-          include: {
-            organization: true,
-            devicePolicy: true,
-          },
-        });
-      }
-
-      // Fallback: Locate globally by unique Remote ID
-      if (!device) {
-        device = await this.prisma.device.findFirst({
-          where: {
-            OR: remoteIdConditions,
-          },
-          include: {
-            organization: true,
-            devicePolicy: true,
-          },
-        });
-      }
-    }
+    dto = parseBody(z.object({
+      targetDeviceId: z.string().uuid().optional(),
+      targetRemoteId: z.string().regex(/^\d{3}[\s-]?\d{3}[\s-]?\d{3}$/).optional(),
+      requestedCapabilities: z.object({ screenView: z.boolean().optional(), control: z.boolean().optional(),
+        clipboard: z.boolean().optional(), fileTransfer: z.boolean().optional(), audioListen: z.literal(false).optional() }).strict().optional(),
+    }).strict().refine(v => !!v.targetDeviceId || !!v.targetRemoteId, 'A target device is required.'), dto);
+    const cleanId = dto.targetRemoteId?.replace(/[\s-]+/g, '');
+    const formattedId = cleanId ? `${cleanId.slice(0, 3)} ${cleanId.slice(3, 6)} ${cleanId.slice(6)}` : undefined;
+    const device = await this.prisma.device.findFirst({
+      where: { organizationId, ...(dto.targetDeviceId ? { id: dto.targetDeviceId } : { OR: [{ remoteId: cleanId }, { remoteId: formattedId }] }) },
+      include: { organization: true, devicePolicy: true },
+    });
 
     if (!device) {
       throw new NotFoundException({
@@ -153,7 +119,7 @@ export class SessionsService {
 
     // 2. Check live presence
     const presence = await this.devicesService.getDevicePresence(device.id);
-    if (presence === DeviceStatus.OFFLINE) {
+    if (presence !== DeviceStatus.ONLINE) {
       throw new BadRequestException({
         code: 'SESSION_DEVICE_OFFLINE',
         message: 'The remote device is currently offline.',
@@ -161,27 +127,29 @@ export class SessionsService {
       });
     }
 
-    // 3. Evaluate device policy
     const policy = device.devicePolicy;
-    if (policy && policy.requireMfa && viewerEmail !== 'viewer@kryptonremote.net') {
-      const user = await this.prisma.user.findUnique({ where: { id: viewerUserId } });
-      if (!user?.mfaEnabled) {
-        throw new ForbiddenException({
-          code: 'POLICY_MFA_REQUIRED',
-          message: 'Device policy requires multi-factor authentication to initiate remote sessions.',
-          retryable: false,
-        });
-      }
+    const tenantPolicy = tenantPolicySchema.parse({ ...tenantPolicySchema.parse({}), ...(device.organization.policy as object) });
+    if ((policy?.requireMfa || tenantPolicy.requireMfa) && !mfaVerified) {
+      throw new ForbiddenException({ code: 'POLICY_MFA_REQUIRED', message: 'This device requires an authenticated MFA login.' });
     }
-
-    // 4. Determine initial requested capabilities
+    if (policy?.requireSessionRecording || tenantPolicy.sessionRecording) {
+      throw new ForbiddenException('Recording-required sessions are unavailable until a recording backend is configured.');
+    }
     const requestedCaps: SessionCapabilities = {
       screenView: dto.requestedCapabilities?.screenView ?? true,
       control: dto.requestedCapabilities?.control ?? false,
-      clipboard: dto.requestedCapabilities?.clipboard ?? (policy?.allowClipboard ?? false),
-      fileTransfer: dto.requestedCapabilities?.fileTransfer ?? (policy?.allowFileTransfer ?? false),
-      audioListen: dto.requestedCapabilities?.audioListen ?? false,
+      clipboard: (dto.requestedCapabilities?.clipboard ?? false) && !!policy?.allowClipboard && tenantPolicy.clipboardPolicy !== 'DISABLED',
+      fileTransfer: (dto.requestedCapabilities?.fileTransfer ?? false) && !!policy?.allowFileTransfer && tenantPolicy.maxFileMb > 0,
+      audioListen: false,
     };
+    if (!guest) {
+      const permissions = await this.rbac.getUserPermissions(viewerUserId);
+      const checks: [boolean, KryptonPermission][] = [
+        [requestedCaps.screenView, KryptonPermission.REMOTE_SCREEN_VIEW], [requestedCaps.control, KryptonPermission.REMOTE_CONTROL],
+        [requestedCaps.clipboard, KryptonPermission.REMOTE_CLIPBOARD_WRITE], [requestedCaps.fileTransfer, KryptonPermission.REMOTE_FILE_UPLOAD],
+      ];
+      if (checks.some(([enabled, permission]) => enabled && !permissions.has(permission))) throw new ForbiddenException('Requested capability is not permitted by your role.');
+    }
 
     const sessionId = uuidv4();
     const nonce = crypto.randomBytes(16).toString('hex');
@@ -195,7 +163,11 @@ export class SessionsService {
     );
 
     // 5. Create durable record in PostgreSQL
-    const remoteSession = await this.prisma.remoteSession.create({
+    const remoteSession = await this.prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`session:${device.id}`}))::text`;
+      const pending = await tx.remoteSession.count({ where: { deviceId: device.id, state: 'AUTHORIZING', createdAt: { gt: new Date(Date.now() - 300_000) } } });
+      if (pending >= 3) throw new BadRequestException('This host already has pending requests. Try again later.');
+      return tx.remoteSession.create({
       data: {
         id: sessionId,
         deviceId: device.id,
@@ -211,6 +183,7 @@ export class SessionsService {
         capabilities: true,
         device: true,
       },
+      });
     });
 
     // 6. Cache in Redis with expiration
@@ -227,6 +200,7 @@ export class SessionsService {
         capabilities: requestedCaps,
         sessionToken,
         expiresAt: expiresAtMs,
+        policy: tenantPolicy,
       })
     );
 
@@ -249,7 +223,8 @@ export class SessionsService {
     await redisClient.publish(
       SessionsService.SIGNALING_CHANNEL,
       JSON.stringify({
-        targetEntityId: device.id,
+        targetTenantId: device.organizationId,
+        targetSubjectId: device.id,
         message: signalingMsg,
       })
     );
@@ -284,6 +259,7 @@ export class SessionsService {
       expiresAt: new Date(expiresAtMs).toISOString(),
       requestedCapabilities: requestedCaps,
       iceConfiguration: this.iceService.generateIceConfiguration(viewerUserId),
+      signalingUrl: getConfig().SIGNALING_PUBLIC_URL,
     };
   }
 
@@ -295,129 +271,32 @@ export class SessionsService {
     ipAddress?: string,
     userAgent?: string
   ) {
-    const cleanId = (dto.targetRemoteId || '').replace(/\s+/g, '');
-    if (!cleanId || cleanId.length < 6) {
-      throw new BadRequestException({
-        code: 'INVALID_REMOTE_ID',
-        message: 'Please provide a valid 9-digit Remote ID.',
-      });
+    dto = parseBody(z.object({ targetRemoteId: z.string().regex(/^\d{3}[\s-]?\d{3}[\s-]?\d{3}$/), pin: z.string().max(32).optional() }).strict(), dto);
+    if (dto.pin) throw new BadRequestException('PIN access is unavailable. Request host approval instead.');
+    const cleanId = dto.targetRemoteId.replace(/[\s-]+/g, '');
+    const formattedId = `${cleanId.slice(0, 3)} ${cleanId.slice(3, 6)} ${cleanId.slice(6)}`;
+    const device = await this.prisma.device.findFirst({ where: { OR: [{ remoteId: cleanId }, { remoteId: formattedId }] } });
+    if (!device || device.status === 'REVOKED') throw new NotFoundException('Device is unavailable.');
+    // Each guest has a distinct identity and a token bound to this one session.
+    // DEACTIVATED accounts can never log in or access the administration API.
+    const guestId = uuidv4();
+    const viewer = await this.prisma.user.create({ data: {
+      id: guestId, organizationId: device.organizationId, email: `guest-${guestId}@guest.invalid`,
+      username: `guest-${guestId}`, passwordHash: 'DISABLED', status: 'DEACTIVATED',
+    } });
+    let session;
+    try {
+      session = await this.createSession(viewer.id, 'Guest browser viewer (identity unverified)', device.organizationId,
+        { targetDeviceId: device.id, requestedCapabilities: { screenView: true, control: true, clipboard: true, fileTransfer: true } },
+        ipAddress, userAgent, false, true);
+    } catch (error) {
+      await this.prisma.user.delete({ where: { id: viewer.id } });
+      throw error;
     }
-
-    const formattedId = cleanId.length === 9
-      ? `${cleanId.slice(0, 3)} ${cleanId.slice(3, 6)} ${cleanId.slice(6)}`
-      : cleanId;
-
-    // 1. Locate device by clean or formatted remoteId
-    let device = await this.prisma.device.findFirst({
-      where: {
-        OR: [
-          { remoteId: cleanId },
-          { remoteId: formattedId },
-          { remoteId: dto.targetRemoteId },
-        ],
-      },
-      include: {
-        organization: true,
-        devicePolicy: true,
-      },
-    });
-
-    // 2. Auto-provision default organization and device if registering on-the-fly
-    if (!device) {
-      let defaultOrg = await this.prisma.organization.findFirst();
-      if (!defaultOrg) {
-        defaultOrg = await this.prisma.organization.create({
-          data: {
-            name: 'Krypton Remote Cloud',
-            slug: 'krypton-cloud',
-          },
-        });
-      }
-
-      device = await this.prisma.device.create({
-        data: {
-          organizationId: defaultOrg.id,
-          remoteId: cleanId,
-          deviceName: `Remote PC (${cleanId})`,
-          hostname: `host-${cleanId}`,
-          os: 'Windows',
-          osVersion: '10.0',
-          architecture: 'x86_64',
-          agentVersion: '1.0.0',
-          status: 'ONLINE',
-          lastSeenAt: new Date(),
-          lastIpAddress: ipAddress,
-        },
-        include: {
-          organization: true,
-          devicePolicy: true,
-        },
-      });
-    }
-
-    // Set active presence in Redis cache
-    const redisClient = this.redis.getClient();
-    await redisClient.setex(`krypton:presence:${device.id}`, 600, 'ONLINE');
-
-    // 3. Locate or create a dedicated web viewer user account
-    let viewerUser = await this.prisma.user.findFirst({
-      where: { email: 'viewer@kryptonremote.net' },
-    });
-    if (!viewerUser) {
-      viewerUser = await this.prisma.user.create({
-        data: {
-          organizationId: device.organizationId,
-          email: 'viewer@kryptonremote.net',
-          username: 'web-viewer',
-          passwordHash: 'managed_system_account_not_for_login',
-        },
-      });
-    }
-
     const config = getConfig();
-    const accessToken = jwt.sign(
-      {
-        sub: viewerUser.id,
-        email: viewerUser.email,
-        organizationId: device.organizationId,
-        role: 'VIEWER',
-      },
-      config.JWT_ACCESS_SECRET,
-      { expiresIn: '8h' }
-    );
-
-    // 4. Create authoritative remote session
-    const session = await this.createSession(
-      viewerUser.id,
-      'Web Browser Viewer',
-      device.organizationId,
-      {
-        targetDeviceId: device.id,
-        targetRemoteId: device.remoteId,
-        requestedCapabilities: {
-          screenView: true,
-          control: true,
-          clipboard: true,
-          fileTransfer: true,
-          audioListen: false,
-        },
-      },
-      ipAddress,
-      userAgent
-    );
-
-    const iceConfiguration = this.iceService.generateIceConfiguration(viewerUser.id);
-
-    return {
-      sessionId: session.sessionId,
-      sessionToken: session.sessionToken,
-      accessToken,
-      iceConfiguration,
-      signalingUrl: config.SIGNALING_PUBLIC_URL,
-      targetDeviceId: device.id,
-      targetRemoteId: device.remoteId,
-      deviceName: device.deviceName,
-    };
+    const accessToken = jwt.sign({ sub: viewer.id, organizationId: device.organizationId,
+      tokenUse: 'guest-session', sessionId: session.sessionId }, config.JWT_ACCESS_SECRET, { expiresIn: '1h' });
+    return { ...session, accessToken, signalingUrl: config.SIGNALING_PUBLIC_URL, deviceName: device.deviceName };
   }
 
   /**
@@ -426,16 +305,16 @@ export class SessionsService {
   async acceptSession(
     sessionId: string,
     acceptedCaps: SessionCapabilities,
-    hostDeviceId?: string
+    hostDeviceId: string
   ) {
     const session = await this.prisma.remoteSession.findUnique({
       where: { id: sessionId },
-      include: { device: true },
+      include: { device: true, capabilities: true },
     });
 
     if (!session) throw new NotFoundException('Session not found');
 
-    if (hostDeviceId && session.deviceId !== hostDeviceId) {
+    if (!hostDeviceId || session.deviceId !== hostDeviceId) {
       throw new ForbiddenException('Device mismatch for session consent.');
     }
 
@@ -443,9 +322,23 @@ export class SessionsService {
       throw new BadRequestException(`Cannot accept session in state ${session.state}`);
     }
 
+    acceptedCaps = parseBody(z.object({ screenView: z.boolean(), control: z.boolean(), clipboard: z.boolean(), fileTransfer: z.boolean(), audioListen: z.literal(false) }).strict(), acceptedCaps);
+    if (Object.entries(acceptedCaps).some(([key, enabled]) => enabled && !(session.capabilities as any)?.[key])) {
+      throw new ForbiddenException('Accepted capabilities cannot exceed requested capabilities.');
+    }
+    if (session.createdAt.getTime() + 300_000 <= Date.now()) throw new BadRequestException('Session request has expired.');
+    const redisClient = this.redis.getClient();
+    const redisKey = `krypton:session:${sessionId}`;
+    const raw = await redisClient.get(redisKey);
+    if (!raw) throw new BadRequestException('Session request has expired.');
     // Update state to SIGNALING and save immutable negotiated capabilities
-    const updated = await this.prisma.remoteSession.update({
-      where: { id: sessionId },
+    const updated = await this.prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${`session:${session.deviceId}`}))::text`;
+      const active = await tx.remoteSession.count({ where: { deviceId: session.deviceId,
+        state: { in: ['SIGNALING', 'ICE_GATHERING', 'CONNECTING', 'CONNECTED', 'DEGRADED', 'RECONNECTING'] } } });
+      if (active > 0) throw new BadRequestException('Host already has an active session.');
+      return tx.remoteSession.update({
+      where: { id: sessionId, state: SessionState.AUTHORIZING },
       data: {
         state: SessionState.SIGNALING,
         startedAt: new Date(),
@@ -454,17 +347,18 @@ export class SessionsService {
         },
       },
       include: { capabilities: true },
+      });
     });
 
-    // Update Redis
-    const redisClient = this.redis.getClient();
-    const redisKey = `krypton:session:${sessionId}`;
-    const raw = await redisClient.get(redisKey);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      parsed.state = SessionState.SIGNALING;
-      parsed.capabilities = acceptedCaps;
-      await redisClient.setex(redisKey, 3600, JSON.stringify(parsed));
+    const parsed = JSON.parse(raw);
+    parsed.state = SessionState.SIGNALING;
+    parsed.capabilities = acceptedCaps;
+    const cached = await redisClient.eval(`if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('SET', KEYS[1], ARGV[2], 'EX', 3600); return 1 end; return 0`,
+      1, redisKey, raw, JSON.stringify(parsed));
+    if (Number(cached) !== 1) {
+      await this.prisma.remoteSession.updateMany({ where: { id: sessionId, state: 'SIGNALING' },
+        data: { state: 'ENDED', endedAt: new Date(), endReason: 'Consent authorization was invalidated' } });
+      throw new BadRequestException('Session authorization was invalidated.');
     }
 
     // Notify viewer via signaling
@@ -482,7 +376,8 @@ export class SessionsService {
     await redisClient.publish(
       SessionsService.SIGNALING_CHANNEL,
       JSON.stringify({
-        targetEntityId: session.viewerUserId,
+        targetTenantId: session.device.organizationId,
+        targetSubjectId: session.viewerUserId,
         message: acceptMsg,
       })
     );
@@ -504,26 +399,29 @@ export class SessionsService {
       state: updated.state,
       capabilities: updated.capabilities,
       iceConfiguration: this.iceService.generateIceConfiguration(session.deviceId),
+      policy: parsed.policy,
     };
   }
 
   /**
    * Host rejects remote session (Section 10)
    */
-  async rejectSession(sessionId: string, reason?: string, hostDeviceId?: string) {
+  async rejectSession(sessionId: string, reason: string | undefined, hostDeviceId: string) {
+    reason = parseBody(z.string().trim().max(256).optional(), reason);
     const session = await this.prisma.remoteSession.findUnique({
       where: { id: sessionId },
-      include: { device: true },
+      include: { device: true, capabilities: true },
     });
 
     if (!session) throw new NotFoundException('Session not found');
 
-    if (hostDeviceId && session.deviceId !== hostDeviceId) {
+    if (!hostDeviceId || session.deviceId !== hostDeviceId) {
       throw new ForbiddenException('Device mismatch for session consent.');
     }
 
+    if (session.state !== SessionState.AUTHORIZING) throw new BadRequestException('Only pending requests can be rejected.');
     await this.prisma.remoteSession.update({
-      where: { id: sessionId },
+      where: { id: sessionId, state: SessionState.AUTHORIZING },
       data: {
         state: SessionState.REJECTED,
         endedAt: new Date(),
@@ -550,7 +448,8 @@ export class SessionsService {
     await redisClient.publish(
       SessionsService.SIGNALING_CHANNEL,
       JSON.stringify({
-        targetEntityId: session.viewerUserId,
+        targetTenantId: session.device.organizationId,
+        targetSubjectId: session.viewerUserId,
         message: rejectMsg,
       })
     );
@@ -573,14 +472,21 @@ export class SessionsService {
   /**
    * Terminate active remote session
    */
-  async endSession(sessionId: string, actorId: string, reason = 'Session ended by user') {
+  async endSession(sessionId: string, actorId: string, organizationId: string, reason = 'Session ended by user') {
+    reason = parseBody(z.string().trim().max(256), reason);
     const session = await this.prisma.remoteSession.findUnique({
       where: { id: sessionId },
-      include: { device: true },
+      include: { device: true, capabilities: true },
     });
 
     if (!session) throw new NotFoundException('Session not found');
 
+    if (!organizationId || session.device.organizationId !== organizationId) throw new NotFoundException('Session not found');
+    if (session.viewerUserId !== actorId && session.deviceId !== actorId &&
+        !(await this.rbac.getUserPermissions(actorId)).has(KryptonPermission.REMOTE_SESSION_TERMINATE)) {
+      throw new ForbiddenException('Session belongs to another viewer.');
+    }
+    if (['ENDED', 'REJECTED', 'EXPIRED', 'FAILED'].includes(session.state)) return { sessionId, state: session.state };
     await this.prisma.remoteSession.update({
       where: { id: sessionId },
       data: {
@@ -591,7 +497,7 @@ export class SessionsService {
     });
 
     const redisClient = this.redis.getClient();
-    await redisClient.del(`krypton:session:${sessionId}`);
+    await redisClient.del(`krypton:session:${sessionId}`, `krypton:session:telemetry:${sessionId}`);
 
     // Broadcast SESSION_END to both parties
     const endMsg = {
@@ -604,11 +510,12 @@ export class SessionsService {
 
     await redisClient.publish(
       SessionsService.SIGNALING_CHANNEL,
-      JSON.stringify({ targetEntityId: session.viewerUserId, message: endMsg })
+      JSON.stringify({ targetTenantId: session.device.organizationId,
+        targetSubjectId: session.viewerUserId, message: endMsg })
     );
     await redisClient.publish(
       SessionsService.SIGNALING_CHANNEL,
-      JSON.stringify({ targetEntityId: session.deviceId, message: endMsg })
+      JSON.stringify({ targetTenantId: session.device.organizationId, targetSubjectId: session.deviceId, message: endMsg })
     );
 
     await this.audit.record({
@@ -630,6 +537,8 @@ export class SessionsService {
    * Get Active Sessions for Admin Monitoring (Section 3 & 5)
    */
   async getActiveSessions(organizationId: string) {
+    await this.prisma.remoteSession.updateMany({ where: { device: { organizationId }, state: 'AUTHORIZING', createdAt: { lte: new Date(Date.now() - 300_000) } },
+      data: { state: 'EXPIRED', endedAt: new Date(), endReason: 'Host consent timed out' } });
     const activeStates = [
       SessionState.AUTHORIZING,
       SessionState.SIGNALING,
@@ -661,10 +570,10 @@ export class SessionsService {
       sessions.map(async (s) => {
         const rawTelemetry = await redisClient.get(`krypton:session:telemetry:${s.id}`);
         let metrics = {
-          fps: 30,
-          bitrateMbps: 3.5,
-          rttMs: 22,
-          packetLossPercent: 0.0,
+          fps: null as number | null,
+          bitrateMbps: null as number | null,
+          rttMs: null as number | null,
+          packetLossPercent: null as number | null,
         };
         let route = s.transportType === 'TURN_RELAY' ? 'TURN_RELAY' : 'DIRECT_P2P';
 
@@ -672,10 +581,10 @@ export class SessionsService {
           try {
             const parsed = JSON.parse(rawTelemetry);
             metrics = {
-              fps: parsed.fps ?? 30,
-              bitrateMbps: parsed.bitrateMbps ?? 3.5,
-              rttMs: parsed.rttMs ?? 22,
-              packetLossPercent: parsed.packetLossPercent ?? 0.0,
+              fps: parsed.fps ?? null,
+              bitrateMbps: parsed.bitrateMbps ?? null,
+              rttMs: parsed.rttMs ?? null,
+              packetLossPercent: parsed.packetLossPercent ?? null,
             };
             if (parsed.route) route = parsed.route;
           } catch {
@@ -692,7 +601,7 @@ export class SessionsService {
 
         return {
           id: s.id,
-          technicianEmail: s.viewerUser?.email || 'technician@kryptonlogic.com',
+          technicianEmail: s.viewerUser?.email || 'Unknown viewer',
           hostDeviceName: s.device.deviceName,
           hostRemoteId: s.device.remoteId,
           route,
@@ -713,16 +622,16 @@ export class SessionsService {
   /**
    * Forcibly terminate active session from admin portal
    */
-  async terminateSession(sessionId: string, actorId: string, reason = 'Administrative Security Termination') {
-    return this.endSession(sessionId, actorId, reason);
+  async terminateSession(sessionId: string, actorId: string, organizationId: string, reason = 'Administrative Security Termination') {
+    return this.endSession(sessionId, actorId, organizationId, reason);
   }
 
   /**
    * Get Session Details
    */
-  async getSession(sessionId: string) {
+  async getSession(sessionId: string, organizationId: string) {
     const session = await this.prisma.remoteSession.findUnique({
-      where: { id: sessionId },
+      where: { id: sessionId, device: { organizationId } },
       include: {
         device: true,
         viewerUser: {
@@ -733,7 +642,39 @@ export class SessionsService {
     });
 
     if (!session) throw new NotFoundException('Session not found');
-    return session;
+    const { sessionToken, ...safeSession } = session;
+    return safeSession;
+  }
+
+  async endGuestSession(sessionId: string, token: string) {
+    let claims: any;
+    try { claims = jwt.verify(token, getConfig().JWT_ACCESS_SECRET, { algorithms: ['HS256'] }); }
+    catch { throw new UnauthorizedException('Invalid or expired session token.'); }
+    if (claims.tokenUse !== 'guest-session' || claims.sessionId !== sessionId || typeof claims.sub !== 'string') throw new ForbiddenException('Invalid guest session scope.');
+    return this.endSession(sessionId, claims.sub, claims.organizationId, 'Viewer disconnected');
+  }
+
+  async updateHostState(sessionId: string, deviceId: string, body: unknown) {
+    const dto = parseBody(z.object({ state: z.enum(['CONNECTED', 'DEGRADED', 'ENDED']), reason: z.string().max(256).optional(),
+      metrics: z.object({ fps: z.number().min(0).max(120).nullable(), bitrateMbps: z.number().min(0).max(1000).nullable(),
+        rttMs: z.number().min(0).max(60000).nullable(), packetLossPercent: z.number().min(0).max(100).nullable(),
+        route: z.enum(['DIRECT_P2P', 'TURN_RELAY']) }).strict().optional(),
+    }).strict(), body);
+    const session = await this.prisma.remoteSession.findUnique({ where: { id: sessionId }, include: { device: true } });
+    if (!session || session.deviceId !== deviceId) throw new NotFoundException('Session not found');
+    if (dto.state === 'ENDED') return this.endSession(sessionId, deviceId, session.device.organizationId, dto.reason);
+    if (!['SIGNALING', 'CONNECTING', 'CONNECTED', 'DEGRADED'].includes(session.state)) throw new BadRequestException('Session is not accepted.');
+    const client = this.redis.getClient();
+    const key = `krypton:session:${sessionId}`;
+    const raw = await client.get(key);
+    if (!raw) throw new BadRequestException('Session has expired');
+    await this.prisma.remoteSession.update({ where: { id: sessionId, state: { in: ['SIGNALING', 'CONNECTING', 'CONNECTED', 'DEGRADED'] } }, data: { state: dto.state,
+      ...(dto.metrics ? { transportType: dto.metrics.route } : {}) } });
+    const refreshed = await client.eval(`if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('SET', KEYS[1], ARGV[2], 'EX', 3600); return 1 end; return 0`,
+      1, key, raw, JSON.stringify({ ...JSON.parse(raw), state: dto.state }));
+    if (Number(refreshed) !== 1) throw new BadRequestException('Session authorization changed.');
+    if (dto.metrics) await client.setex(`krypton:session:telemetry:${sessionId}`, 30, JSON.stringify(dto.metrics));
+    return { acknowledged: true };
   }
 }
 

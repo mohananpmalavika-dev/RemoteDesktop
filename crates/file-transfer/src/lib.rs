@@ -10,6 +10,8 @@ pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024; // 64 KB
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum FileTransferError {
+    #[error("Invalid transfer metadata or chunk length")]
+    InvalidMetadata,
     #[error("Path traversal security violation: illegal destination path")]
     PathTraversalDetected,
     #[error("Checksum mismatch: expected {expected}, actual {actual}")]
@@ -98,7 +100,13 @@ impl TransferVerifier {
 
 /// Validates that a requested filename or relative path contains no directory traversal
 pub fn sanitize_destination_path(base_dir: &Path, user_provided_filename: &str) -> Result<PathBuf, FileTransferError> {
-    if user_provided_filename.contains("..")
+    let stem = user_provided_filename.split('.').next().unwrap_or("").to_ascii_uppercase();
+    if user_provided_filename.is_empty() || user_provided_filename.len() > 255
+        || user_provided_filename.chars().any(|c| c.is_control() || ['/', '\\', ':', '*', '?', '"', '<', '>', '|'].contains(&c))
+        || user_provided_filename.ends_with('.') || user_provided_filename.ends_with(' ')
+        || ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str())
+        || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.as_bytes()[3].is_ascii_digit())
+        || user_provided_filename.contains("..")
         || user_provided_filename.contains(':')
         || user_provided_filename.starts_with('/')
         || user_provided_filename.starts_with('\\')
@@ -143,14 +151,25 @@ pub struct FileTransferReceiver {
     received_chunks: BTreeSet<u32>,
     received_bytes: u64,
     state: TransferState,
+    staging_file: File,
 }
 
 impl FileTransferReceiver {
     pub fn new(metadata: TransferMetadata, base_staging_dir: &Path) -> Result<Self, FileTransferError> {
+        if metadata.transfer_id.is_empty() || metadata.transfer_id.len() > 128 || !metadata.transfer_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return Err(FileTransferError::PathTraversalDetected);
+        }
+        if metadata.chunk_size == 0 || metadata.chunk_size > DEFAULT_CHUNK_SIZE || metadata.file_size_bytes > 500 * 1024 * 1024
+            || metadata.total_chunks == 0 || metadata.total_chunks > 1_000_000
+            || metadata.total_chunks as u64 != metadata.file_size_bytes.div_ceil(metadata.chunk_size as u64).max(1)
+            || metadata.sha256_checksum.len() != 64 || !metadata.sha256_checksum.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(FileTransferError::InvalidMetadata);
+        }
         fs::create_dir_all(base_staging_dir)?;
         let destination_path = sanitize_destination_path(base_staging_dir, &metadata.filename)?;
         let staging_filename = format!("{}.kpart", metadata.transfer_id);
         let staging_path = base_staging_dir.join(staging_filename);
+        let staging_file = OpenOptions::new().write(true).read(true).create_new(true).open(&staging_path)?;
 
         Ok(Self {
             metadata,
@@ -159,6 +178,7 @@ impl FileTransferReceiver {
             received_chunks: BTreeSet::new(),
             received_bytes: 0,
             state: TransferState::Transferring,
+            staging_file,
         })
     }
 
@@ -206,17 +226,17 @@ impl FileTransferReceiver {
                 total_chunks: self.metadata.total_chunks,
             });
         }
+        let offset = chunk.chunk_index as u64 * self.metadata.chunk_size as u64;
+        let expected_size = (self.metadata.file_size_bytes - offset).min(self.metadata.chunk_size as u64) as usize;
+        if chunk.total_chunks != self.metadata.total_chunks || chunk.data.len() != expected_size {
+            return Err(FileTransferError::InvalidMetadata);
+        }
 
         // Only write if not already received (idempotent chunk processing)
         if !self.received_chunks.contains(&chunk.chunk_index) {
             let offset = (chunk.chunk_index as u64) * (self.metadata.chunk_size as u64);
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .open(&self.staging_path)?;
-
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_all(&chunk.data)?;
+            self.staging_file.seek(SeekFrom::Start(offset))?;
+            self.staging_file.write_all(&chunk.data)?;
 
             self.received_chunks.insert(chunk.chunk_index);
             self.received_bytes += chunk.data.len() as u64;
@@ -237,6 +257,7 @@ impl FileTransferReceiver {
     }
 
     fn finalize_verification(&mut self) -> Result<(), FileTransferError> {
+        self.staging_file.sync_all()?;
         // Compute SHA-256 of the completed staging file
         let computed_hash = match compute_file_sha256(&self.staging_path) {
             Ok(h) => h,
@@ -248,10 +269,11 @@ impl FileTransferReceiver {
 
         if computed_hash.eq_ignore_ascii_case(&self.metadata.sha256_checksum) {
             // Atomic rename from staging to destination path
-            if let Err(e) = fs::rename(&self.staging_path, &self.destination_path) {
+            if let Err(e) = fs::hard_link(&self.staging_path, &self.destination_path) {
                 self.state = TransferState::Failed;
                 return Err(FileTransferError::IoError(e.to_string()));
             }
+            let _ = fs::remove_file(&self.staging_path);
             self.state = TransferState::Completed;
             Ok(())
         } else {
@@ -392,6 +414,9 @@ mod tests {
         // Safe filename
         let safe = sanitize_destination_path(base, "report.pdf").unwrap();
         assert_eq!(safe, base.join("report.pdf"));
+        for name in ["CON.txt", "NUL", "COM1.log", "name:stream", "report.txt.", "folder\\report.txt", "\u{0000}bad"] {
+            assert!(sanitize_destination_path(base, name).is_err(), "Unsafe Windows name: {name}");
+        }
     }
 
     #[test]
@@ -485,5 +510,29 @@ mod tests {
         assert_eq!(receiver.state(), TransferState::Failed);
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn rejects_staging_traversal_and_invalid_metadata_before_writing() {
+        let base = std::env::temp_dir().join("krypton_invalid_metadata_does_not_exist");
+        let mut metadata = TransferMetadata { transfer_id: "../escape".into(), filename: "safe.txt".into(),
+            file_size_bytes: 1, chunk_size: 1, total_chunks: 1, sha256_checksum: "0".repeat(64) };
+        assert!(matches!(FileTransferReceiver::new(metadata.clone(), &base), Err(FileTransferError::PathTraversalDetected)));
+        metadata.transfer_id = "safe-id".into(); metadata.chunk_size = 0;
+        assert!(matches!(FileTransferReceiver::new(metadata, &base), Err(FileTransferError::InvalidMetadata)));
+    }
+
+    #[test]
+    fn does_not_overwrite_existing_downloads() {
+        let base = std::env::temp_dir().join(format!("krypton_no_clobber_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&base).unwrap();
+        let existing = base.join("report.txt"); fs::write(&existing, b"keep me").unwrap();
+        let metadata = TransferMetadata { transfer_id: "test-id".into(), filename: "report.txt".into(),
+            file_size_bytes: 1, chunk_size: 1, total_chunks: 1,
+            sha256_checksum: hex::encode(Sha256::digest(b"x")) };
+        let mut receiver = FileTransferReceiver::new(metadata, &base).unwrap();
+        assert!(receiver.receive_chunk(&FileChunk { transfer_id: "test-id".into(), chunk_index: 0, total_chunks: 1, data: vec![b'x'] }).is_err());
+        assert_eq!(fs::read(existing).unwrap(), b"keep me");
+        drop(receiver); let _ = fs::remove_dir_all(base);
     }
 }

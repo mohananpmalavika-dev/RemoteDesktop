@@ -492,3 +492,15 @@ pre,
     transition: none !important;
   }
 }
+
+.auth-panel { position: relative; max-width: 480px; padding: 28px; margin: 0 auto 24px; background: white; }
+.auth-panel form { display: grid; gap: 16px; }
+.auth-panel label { display: grid; gap: 6px; font-size: 14px; }
+.auth-panel input { border: 1px solid var(--line); border-radius: 8px; padding: 10px; width: 100%; }
+.auth-panel button { padding: 10px 14px; border-radius: 8px; border: 1px solid var(--line); cursor: pointer; }
+.auth-panel button[type=submit] { background: var(--brand); color: white; }
+.auth-panel .auth-close { position: absolute; right: 12px; top: 12px; }
+.auth-panel .auth-remember { display: flex; align-items: center; }
+.auth-panel .auth-remember input { width: auto; }
+.auth-panel [role=alert] { color: #b42318; }
+.auth-panel code { overflow-wrap: anywhere; }

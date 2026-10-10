@@ -1,13 +1,10 @@
-﻿import { useState, type FormEvent } from "react";
+﻿import { type FormEvent } from "react";
 import {
   ArrowRight,
   ArrowUpRight,
   Monitor,
-  LockKeyhole,
   ShieldCheck,
   Command,
-  Eye,
-  EyeOff,
   Check,
   Globe2,
   MousePointer2,
@@ -24,7 +21,6 @@ interface Props {
 }
 
 export function ConnectionLaunch(p: Props) {
-  const [showPin, setShowPin] = useState(false);
   return (
     <div className="launch-workspace">
       <section className="launch-panel">
@@ -64,29 +60,6 @@ export function ConnectionLaunch(p: Props) {
                 p.error ? "web-connect-error" : "web-connect-note"
               }
             />
-          </div>
-          <label htmlFor="web-access-pin">
-            Access PIN <span>Optional</span>
-          </label>
-          <div className="launch-input pin-input">
-            <LockKeyhole size={18} />
-            <input
-              id="web-access-pin"
-              type={showPin ? "text" : "password"}
-              autoComplete="off"
-              placeholder="Enter PIN if required"
-              value={p.pin}
-              onChange={(e) => p.onPinChange(e.target.value)}
-            />
-            <button
-              type="button"
-              className="pin-visibility"
-              aria-label={showPin ? "Hide access PIN" : "Show access PIN"}
-              aria-pressed={showPin}
-              onClick={() => setShowPin(!showPin)}
-            >
-              {showPin ? <EyeOff size={17} /> : <Eye size={17} />}
-            </button>
           </div>
           {p.error && (
             <p className="launch-error" id="web-connect-error" role="alert">

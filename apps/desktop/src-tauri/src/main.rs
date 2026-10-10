@@ -17,6 +17,9 @@ use krypton_platform_windows::{
 };
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use base64::Engine;
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, State};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +66,7 @@ pub struct ActiveSessionInfo {
 struct AppState {
     engine: Mutex<RemoteEngine>,
     capture: Mutex<Option<CaptureSession>>,
+    capture_generation: AtomicU64,
     input_dispatcher: Mutex<InputDispatcher>,
     clipboard_dispatcher: Mutex<ClipboardDispatcher>,
     file_transfer_manager: Mutex<FileTransferManager>,
@@ -119,7 +123,86 @@ fn initialize_identity(app: AppHandle, state: State<AppState>) -> Result<Option<
     engine.shareable_remote_id()
 }
 
-const DEFAULT_API_URL: &str = "http://35.244.54.249:4000/api/v1";
+const DEFAULT_API_URL: &str = match option_env!("KRYPTON_API_URL") { Some(url) => url, None => "" };
+
+#[tauri::command]
+fn get_device_registration(app: AppHandle) -> Result<Option<EnrolledIdentity>, String> {
+    let path = identity_directory(&app)?.join("enrolled-device.json");
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|_| "Invalid saved device registration".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[tauri::command]
+fn sign_device_challenge(state: State<AppState>, nonce: String) -> Result<String, String> {
+    if nonce.len() != 64 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) { return Err("Invalid authentication challenge".into()); }
+    let signature = state.engine.lock().map_err(|e| e.to_string())?.sign_device_payload(nonce.as_bytes())?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(signature))
+}
+
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[tauri::command]
+async fn device_api_request(app: AppHandle, state: State<'_, AppState>, path: String, body: serde_json::Value) -> Result<serde_json::Value, String> {
+    let registration = get_device_registration(app)?.ok_or("Device enrollment is required")?;
+    let allowed_device = path == format!("/devices/{}/heartbeat", registration.device_id) || path == format!("/devices/{}/runtime-config", registration.device_id);
+    let parts: Vec<&str> = path.split('/').collect();
+    let allowed_session = parts.len() == 4 && parts[1] == "sessions" && parts[2].len() == 36 &&
+        parts[2].bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') && ["accept", "reject", "host-state"].contains(&parts[3]);
+    if !allowed_device && !allowed_session { return Err("Unsupported device API route".into()); }
+    let mut url = reqwest::Url::parse(&registration.api_url).map_err(|_| "Invalid configured API URL")?;
+    if !cfg!(debug_assertions) && url.scheme() != "https" { return Err("Production device requests require HTTPS".into()); }
+    let full_path = format!("{}{}", url.path().trim_end_matches('/'), path);
+    url.set_path(&full_path);
+    let raw = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis().to_string();
+    let seed = format!("{timestamp}:{}", REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst));
+    let (nonce, signature) = {
+        let engine = state.engine.lock().map_err(|e| e.to_string())?;
+        let nonce = format!("{:x}", Sha256::digest(engine.sign_device_payload(seed.as_bytes())?))[..32].to_string();
+        let payload = format!("POST\n{full_path}\n{timestamp}\n{nonce}\n{:x}", Sha256::digest(&raw));
+        let signature = base64::engine::general_purpose::STANDARD.encode(engine.sign_device_payload(payload.as_bytes())?);
+        (nonce, signature)
+    };
+    let response = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).redirect(reqwest::redirect::Policy::none())
+        .build().map_err(|e| e.to_string())?.post(url).header("Content-Type", "application/json")
+        .header("x-device-id", registration.device_id).header("x-device-timestamp", timestamp)
+        .header("x-device-nonce", nonce).header("x-device-signature", signature).body(raw).send().await.map_err(|e| e.to_string())?;
+    let status = response.status();
+    let result: serde_json::Value = response.json().await.map_err(|_| "Invalid server response")?;
+    if !status.is_success() { return Err(result.get("message").and_then(|v| v.as_str()).unwrap_or("Device request rejected").to_string()); }
+    Ok(result)
+}
+
+#[tauri::command]
+fn get_device_heartbeat(state: State<AppState>) -> Result<serde_json::Value, String> {
+    let telemetry = state.engine.lock().map_err(|e| e.to_string())?.create_heartbeat()?;
+    let live = krypton_platform_windows::get_live_system_telemetry();
+    Ok(serde_json::json!({ "agentVersion": telemetry.agent_version, "os": telemetry.os, "osVersion": telemetry.os_version,
+        "architecture": telemetry.architecture, "sessionCount": if state.active_session.lock().map_err(|e| e.to_string())?.is_some() { 1 } else { 0 },
+        "cpuPercent": live.cpu_load_pct, "memoryPercent": live.ram_usage_pct, "uptimeSeconds": telemetry.uptime_seconds }))
+}
+
+#[tauri::command]
+async fn viewer_api_request(api_url: String, path: String, body: serde_json::Value, token: Option<String>) -> Result<serde_json::Value, String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if path != "/sessions/quick-connect" && !(parts.len() == 4 && parts[1] == "sessions" && parts[3] == "guest-end" &&
+        parts[2].len() == 36 && parts[2].bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')) { return Err("Unsupported viewer API route".into()); }
+    let mut url = reqwest::Url::parse(&api_url).map_err(|_| "Invalid API URL")?;
+    if !["https", "http"].contains(&url.scheme()) || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() { return Err("Invalid API URL".into()); }
+    if !cfg!(debug_assertions) && url.scheme() != "https" { return Err("Production viewer requires HTTPS".into()); }
+    url.set_path(&format!("{}{}", url.path().trim_end_matches('/'), path));
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build().map_err(|e| e.to_string())?;
+    let mut request = client.post(url).json(&body);
+    if let Some(token) = token { request = request.bearer_auth(token); }
+    let response = request.send().await.map_err(|e| e.to_string())?;
+    let status = response.status();
+    let result: serde_json::Value = response.json().await.map_err(|_| "Invalid API response")?;
+    if !status.is_success() { return Err(result.get("message").and_then(|v| v.as_str()).unwrap_or("Viewer request rejected").into()); }
+    Ok(result)
+}
 
 #[tauri::command]
 async fn enroll_device(
@@ -154,6 +237,8 @@ async fn enroll_device(
     };
     url.set_path(&enrollment_path);
     let token = enrollment_token.as_deref().unwrap_or("").trim();
+    if token.is_empty() { return Err("Enter the enrollment token issued by your workspace administrator.".into()); }
+    if !cfg!(debug_assertions) && url.scheme() != "https" { return Err("Production enrollment requires HTTPS.".into()); }
     let request = {
         let mut engine = state.engine.lock().map_err(|e| e.to_string())?;
         if let Some(id) = engine.shareable_remote_id()? { return Ok(id); }
@@ -165,7 +250,7 @@ async fn enroll_device(
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build().map_err(|_| "Could not initialize the registration client.".to_string())?;
-    let response = client.post(url).json(&request).send().await
+    let response = client.post(url.clone()).json(&request).send().await
         .map_err(|_| "Could not reach the Krypton cloud server. Check network connection.".to_string())?;
     if !response.status().is_success() {
         return Err(match response.status().as_u16() {
@@ -181,9 +266,10 @@ async fn enroll_device(
         .map_err(|_| "The API returned an invalid device registration response.".to_string())?;
     if result.device_id.trim().is_empty() { return Err("The API returned an empty device ID.".into()); }
     let remote_id = krypton_remote_core::format_remote_id(&result.remote_id)?;
+    let base_url = url.as_str().trim_end_matches("/devices/enroll").to_string();
     let saved = EnrolledIdentity {
         device_id: result.device_id.clone(), remote_id: remote_id.clone(),
-        public_key_base64: request.public_key_base64, api_url: effective_url.to_string(),
+        public_key_base64: request.public_key_base64, api_url: base_url,
     };
     let directory = identity_directory(&app)?;
     let bytes = serde_json::to_vec(&saved).map_err(|e| e.to_string())?;
@@ -226,6 +312,7 @@ fn start_capture(
     session_id: String,
 ) -> Result<String, String> {
     let mut capture_guard = state.capture.lock().map_err(|e| e.to_string())?;
+    let generation = state.capture_generation.fetch_add(1, Ordering::SeqCst) + 1;
 
     // Stop any existing session
     if let Some(mut old) = capture_guard.take() {
@@ -269,6 +356,7 @@ fn start_capture(
             let mut total_frames = 0usize;
 
             loop {
+                if state_ref.capture_generation.load(Ordering::SeqCst) != generation { break; }
                 std::thread::sleep(frame_interval / 2); // Poll at 2x frame rate
 
                 // Try to read a frame from the capture session
@@ -277,6 +365,7 @@ fn start_capture(
                         Ok(g) => g,
                         Err(_) => break,
                     };
+                    if state_ref.capture_generation.load(Ordering::SeqCst) != generation { break; }
                     match guard.as_ref() {
                         Some(session) => {
                             if !session.is_running() { break; }
@@ -309,6 +398,7 @@ fn start_capture(
 
 #[tauri::command]
 fn stop_capture(state: State<AppState>) -> Result<(), String> {
+    state.capture_generation.fetch_add(1, Ordering::SeqCst);
     let mut capture_guard = state.capture.lock().map_err(|e| e.to_string())?;
     if let Some(mut session) = capture_guard.take() {
         session.stop();
@@ -318,9 +408,9 @@ fn stop_capture(state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_capture_bitrate(_state: State<AppState>, bitrate_kbps: u32) -> Result<(), String> {
-    log::info!("[tauri] Bitrate update to {bitrate_kbps}kbps (applied on next session restart)");
-    Ok(())
+fn set_capture_bitrate(state: State<AppState>, bitrate_kbps: u32) -> Result<(), String> {
+    let capture = state.capture.lock().map_err(|e| e.to_string())?;
+    capture.as_ref().ok_or("No active capture")?.update_bitrate(bitrate_kbps)
 }
 
 #[tauri::command]
@@ -613,14 +703,13 @@ fn start_viewer_session(
     sm.transition(SessionState::Signaling).map_err(|e| format!("{e}"))?;
     sm.transition(SessionState::IceGathering).map_err(|e| format!("{e}"))?;
     sm.transition(SessionState::Connecting).map_err(|e| format!("{e}"))?;
-    sm.transition(SessionState::Connected).map_err(|e| format!("{e}"))?;
 
     let route = format!("{:?}", pc.route());
     let info = ActiveSessionInfo {
         session_id: session_id.clone(),
         target_id: target_remote_id,
         mode: DesktopMode::Viewer,
-        state: "Connected".to_string(),
+        state: "Connecting".to_string(),
         route,
     };
 
@@ -635,6 +724,7 @@ fn start_host_session(
     state: State<AppState>,
     session_id: String,
     viewer_id: String,
+    allow_screen_view: bool,
     allow_control: bool,
     allow_clipboard: bool,
     allow_file_transfer: bool,
@@ -656,6 +746,7 @@ fn start_host_session(
     *gate_guard = gate;
 
     {
+        state.input_dispatcher.lock().map_err(|e| e.to_string())?.set_permission_granted(allow_control);
         let mut clip_guard = state.clipboard_dispatcher.lock().map_err(|e| e.to_string())?;
         clip_guard.set_permission_granted(allow_clipboard);
         let mut file_guard = state.file_transfer_manager.lock().map_err(|e| e.to_string())?;
@@ -677,17 +768,16 @@ fn start_host_session(
     sm.transition(SessionState::Signaling).map_err(|e| format!("{e}"))?;
     sm.transition(SessionState::IceGathering).map_err(|e| format!("{e}"))?;
     sm.transition(SessionState::Connecting).map_err(|e| format!("{e}"))?;
-    sm.transition(SessionState::Connected).map_err(|e| format!("{e}"))?;
 
     // Host starts capture pipeline
-    start_capture(app, state.clone(), display_id, fps, bitrate_kbps, session_id.clone())?;
+    if allow_screen_view { start_capture(app, state.clone(), display_id, fps, bitrate_kbps, session_id.clone())?; }
 
     let route = format!("{:?}", pc.route());
     let info = ActiveSessionInfo {
         session_id: session_id.clone(),
         target_id: viewer_id,
         mode: DesktopMode::HostAgent,
-        state: "Connected".to_string(),
+        state: "Connecting".to_string(),
         route,
     };
 
@@ -759,6 +849,11 @@ fn trigger_ice_restart(state: State<AppState>) -> Result<(), String> {
 
 #[tauri::command]
 fn disconnect_session(state: State<AppState>) -> Result<(), String> {
+    *state.permission_gate.lock().map_err(|e| e.to_string())? = SessionPermissionGate::new(false, false, false, false);
+    state.input_dispatcher.lock().map_err(|e| e.to_string())?.set_permission_granted(false);
+    state.clipboard_dispatcher.lock().map_err(|e| e.to_string())?.set_permission_granted(false);
+    { let mut files = state.file_transfer_manager.lock().map_err(|e| e.to_string())?; files.set_permission_granted(false); files.cancel_all(); }
+    state.capture_generation.fetch_add(1, Ordering::SeqCst);
     let mut session_guard = state.active_session.lock().map_err(|e| e.to_string())?;
     *session_guard = None;
 
@@ -788,15 +883,16 @@ fn main() {
         env_logger::Env::default().default_filter_or("info")
     ).init();
 
-    let download_dir = std::env::temp_dir().join("krypton_downloads");
+    let download_dir = std::env::var("USERPROFILE").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir()).join("Downloads").join("KryptonRemote");
 
     tauri::Builder::default()
         .manage(AppState {
             engine: Mutex::new(RemoteEngine::new()),
             capture: Mutex::new(None),
-            input_dispatcher: Mutex::new(InputDispatcher::new()),
-            clipboard_dispatcher: Mutex::new(ClipboardDispatcher::new()),
-            file_transfer_manager: Mutex::new(FileTransferManager::new(download_dir)),
+            capture_generation: AtomicU64::new(0),
+            input_dispatcher: Mutex::new({ let mut dispatcher = InputDispatcher::new(); dispatcher.set_permission_granted(false); dispatcher }),
+            clipboard_dispatcher: Mutex::new({ let mut dispatcher = ClipboardDispatcher::new(); dispatcher.set_permission_granted(false); dispatcher }),
+            file_transfer_manager: Mutex::new({ let mut manager = FileTransferManager::new(download_dir); manager.set_permission_granted(false); manager }),
             tray_manager: Mutex::new(SystemTrayManager::new()),
             service_manager: Mutex::new(WindowsServiceManager::new(
                 "KryptonRemoteAgent",
@@ -814,6 +910,11 @@ fn main() {
             get_engine_state,
             initialize_identity,
             enroll_device,
+            get_device_registration,
+            sign_device_challenge,
+            device_api_request,
+            get_device_heartbeat,
+            viewer_api_request,
             get_capture_displays,
             start_capture,
             stop_capture,

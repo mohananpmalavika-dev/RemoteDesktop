@@ -7,6 +7,7 @@ import { RedisService } from '../redis/redis.service';
 import { AuditService } from '../audit/audit.service';
 import { DevicesService } from '../devices/devices.service';
 import { RbacService } from '../rbac/rbac.service';
+import { DeviceAuthGuard } from '../auth/device-auth.guard';
 
 @Module({
   controllers: [SessionsController],
@@ -18,6 +19,7 @@ import { RbacService } from '../rbac/rbac.service';
     AuditService,
     DevicesService,
     RbacService,
+    DeviceAuthGuard,
   ],
   exports: [SessionsService, IceCredentialsService],
 })

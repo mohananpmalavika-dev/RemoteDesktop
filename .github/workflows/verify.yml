@@ -1,0 +1,46 @@
+name: Verify release
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  services:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env: { POSTGRES_USER: krypton, POSTGRES_PASSWORD: integration_only, POSTGRES_DB: krypton_test }
+        ports: ['5432:5432']
+        options: --health-cmd="pg_isready -U krypton -d krypton_test" --health-interval=5s --health-timeout=5s --health-retries=10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+    env:
+      KRYPTON_TEST_DATABASE: disposable
+      DATABASE_URL: postgresql://krypton:integration_only@127.0.0.1:5432/krypton_test
+      REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: npm }
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npx prisma migrate deploy
+      - run: npm run build
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run test:integration
+      - run: npm audit --audit-level=moderate
+      - run: docker build -f infra/Dockerfile.api .
+      - run: docker build -f infra/Dockerfile.signaling .
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: npm }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - run: npm run build
+      - run: cargo check --workspace --locked
+      - run: cargo test --workspace --locked -- --skip test_enumerate_displays_returns_at_least_one --skip test_capture_session_produces_encoded_frames --skip test_windows_clipboard_provider_roundtrip

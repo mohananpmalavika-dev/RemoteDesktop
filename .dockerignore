@@ -1,0 +1,14 @@
+.git
+node_modules
+**/node_modules
+target
+**/target
+**/dist
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.tar.gz
+repopack-output.txt
+docs/ui-redesign
